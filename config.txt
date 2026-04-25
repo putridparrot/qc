@@ -19,3 +19,9 @@ dry_run=false
 # default uses shortcuts.txt
 # other values use shortcuts.<profile>.txt
 active_profile=default
+
+# Optional per-profile execution policy patterns:
+# policy.<profile>.allow=comma,separated,substrings
+# policy.<profile>.deny=comma,separated,substrings
+# Deny patterns always block.
+# If allow is set for a profile, command text must match at least one allow pattern.

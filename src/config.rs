@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -17,12 +18,19 @@ pub enum SafetyPolicy {
     Block,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionPolicy {
+    pub allow_patterns: Vec<String>,
+    pub deny_patterns: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub max_history_items: isize,
     pub safety_policy: SafetyPolicy,
     pub dry_run: bool,
     pub active_profile: String,
+    pub profile_policies: HashMap<String, ExecutionPolicy>,
 }
 
 impl Default for AppConfig {
@@ -32,6 +40,7 @@ impl Default for AppConfig {
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
             active_profile: "default".to_owned(),
+            profile_policies: HashMap::new(),
         }
     }
 }
@@ -45,6 +54,21 @@ impl AppConfig {
             _ => HistoryLimit::Disabled,
         }
     }
+
+    pub fn policy_for_profile(&self, profile: &str) -> ExecutionPolicy {
+        self.profile_policies
+            .get(profile)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn parse_patterns(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
@@ -126,12 +150,47 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
                 config.active_profile = profile.to_owned();
             }
             unknown => {
-                bail!(
-                    "Unknown config key '{}' at {}:{}",
-                    unknown,
-                    path.display(),
-                    index + 1
-                );
+                if let Some(rest) = unknown.strip_prefix("policy.") {
+                    let Some((profile, policy_kind)) = rest.rsplit_once('.') else {
+                        bail!(
+                            "Invalid policy config key '{}' at {}:{}; expected policy.<profile>.allow|deny",
+                            unknown,
+                            path.display(),
+                            index + 1
+                        );
+                    };
+                    if profile.trim().is_empty() {
+                        bail!(
+                            "Invalid policy profile in key '{}' at {}:{}",
+                            unknown,
+                            path.display(),
+                            index + 1
+                        );
+                    }
+
+                    let policy = config
+                        .profile_policies
+                        .entry(profile.trim().to_owned())
+                        .or_default();
+
+                    match policy_kind.trim() {
+                        "allow" => policy.allow_patterns = parse_patterns(value),
+                        "deny" => policy.deny_patterns = parse_patterns(value),
+                        _ => bail!(
+                            "Invalid policy key '{}' at {}:{}; expected allow or deny suffix",
+                            unknown,
+                            path.display(),
+                            index + 1
+                        ),
+                    }
+                } else {
+                    bail!(
+                        "Unknown config key '{}' at {}:{}",
+                        unknown,
+                        path.display(),
+                        index + 1
+                    );
+                }
             }
         }
     }
@@ -147,13 +206,34 @@ pub fn save_config(path: impl AsRef<Path>, config: &AppConfig) -> Result<()> {
         SafetyPolicy::Block => "block",
     };
 
-    let content = format!(
+    let mut content = format!(
         "max_history_items={}\n\
 safety_policy={}\n\
 dry_run={}\n\
 active_profile={}\n",
         config.max_history_items, safety_policy, config.dry_run, config.active_profile
     );
+
+    let mut profiles = config.profile_policies.keys().cloned().collect::<Vec<_>>();
+    profiles.sort();
+    for profile in profiles {
+        if let Some(policy) = config.profile_policies.get(&profile) {
+            if !policy.allow_patterns.is_empty() {
+                content.push_str(&format!(
+                    "policy.{}.allow={}\n",
+                    profile,
+                    policy.allow_patterns.join(",")
+                ));
+            }
+            if !policy.deny_patterns.is_empty() {
+                content.push_str(&format!(
+                    "policy.{}.deny={}\n",
+                    profile,
+                    policy.deny_patterns.join(",")
+                ));
+            }
+        }
+    }
 
     fs::write(path, content)
         .with_context(|| format!("Failed to write config file: {}", path.display()))
@@ -180,18 +260,21 @@ mod tests {
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
             active_profile: "default".to_owned(),
+            profile_policies: HashMap::new(),
         };
         let unlimited = AppConfig {
             max_history_items: -1,
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
             active_profile: "default".to_owned(),
+            profile_policies: HashMap::new(),
         };
         let limited = AppConfig {
             max_history_items: 25,
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
             active_profile: "default".to_owned(),
+            profile_policies: HashMap::new(),
         };
 
         assert_eq!(disabled.history_limit(), HistoryLimit::Disabled);
@@ -204,7 +287,7 @@ mod tests {
         let path = temp_file("config-valid");
         fs::write(
             &path,
-            "max_history_items=10\nsafety_policy=block\ndry_run=true\nactive_profile=prod\n",
+            "max_history_items=10\nsafety_policy=block\ndry_run=true\nactive_profile=prod\npolicy.prod.allow=kubectl,get\npolicy.prod.deny=rm -rf,drop table\n",
         )
         .expect("write config");
 
@@ -213,6 +296,9 @@ mod tests {
         assert_eq!(cfg.safety_policy, SafetyPolicy::Block);
         assert!(cfg.dry_run);
         assert_eq!(cfg.active_profile, "prod");
+        let prod = cfg.policy_for_profile("prod");
+        assert_eq!(prod.allow_patterns, vec!["kubectl", "get"]);
+        assert_eq!(prod.deny_patterns, vec!["rm -rf", "drop table"]);
 
         let _ = fs::remove_file(path);
     }
@@ -237,6 +323,13 @@ mod tests {
             safety_policy: SafetyPolicy::Warn,
             dry_run: true,
             active_profile: "dev".to_owned(),
+            profile_policies: HashMap::from([(
+                "dev".to_owned(),
+                ExecutionPolicy {
+                    allow_patterns: vec!["kubectl".to_owned()],
+                    deny_patterns: vec!["rm -rf".to_owned()],
+                },
+            )]),
         };
 
         save_config(&path, &config).expect("save config");
@@ -245,6 +338,9 @@ mod tests {
         assert_eq!(reloaded.safety_policy, SafetyPolicy::Warn);
         assert!(reloaded.dry_run);
         assert_eq!(reloaded.active_profile, "dev");
+        let dev = reloaded.policy_for_profile("dev");
+        assert_eq!(dev.allow_patterns, vec!["kubectl"]);
+        assert_eq!(dev.deny_patterns, vec!["rm -rf"]);
 
         let _ = fs::remove_file(path);
     }

@@ -9,6 +9,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,14 +37,32 @@ const AUDIT_LOG_FILE: &str = "audit.log";
 const EXPORT_HEADER: &str = "# qc-export:v1";
 const BACKUP_DIR: &str = "backups";
 const LAST_BACKUP_FILE: &str = ".qc_last_backup";
+const EXIT_CODE_SUCCESS: i32 = 0;
+const EXIT_CODE_BLOCKED: i32 = 20;
+const EXIT_CODE_FAILED: i32 = 30;
 
-struct CmdStylePrompt;
+type SharedActiveProfile = Arc<RwLock<String>>;
+
+struct CmdStylePrompt {
+    active_profile: SharedActiveProfile,
+}
 
 impl CmdStylePrompt {
+    fn new(active_profile: SharedActiveProfile) -> Self {
+        Self { active_profile }
+    }
+
     fn current_dir_display() -> String {
         env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| ".".to_owned())
+    }
+
+    fn active_profile_display(&self) -> String {
+        self.active_profile
+            .read()
+            .map(|profile| profile.clone())
+            .unwrap_or_else(|_| "default".to_owned())
     }
 }
 
@@ -57,7 +76,11 @@ impl Prompt for CmdStylePrompt {
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Owned(format!("QC {}>", Self::current_dir_display()))
+        Cow::Owned(format!(
+            "QC [{}] {}>",
+            self.active_profile_display(),
+            Self::current_dir_display()
+        ))
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
@@ -82,6 +105,7 @@ enum FindResult {
 enum BuiltinCommand {
     Help,
     Doctor,
+    PolicyShow,
     SetDryRun(bool),
     ProfileList,
     ProfileUse(String),
@@ -92,7 +116,12 @@ enum BuiltinCommand {
     ShortcutsDel(String),
     HistoryList,
     HistoryRanked,
+    HistoryTop(Option<String>),
+    HistoryRecent(Option<String>),
     HistoryAdd(String),
+    HistorySearch(String),
+    HistoryEdit(String),
+    HistoryRun(String),
     HistoryPin(String),
     HistoryUnpin(String),
     HistoryDel(String),
@@ -119,6 +148,10 @@ fn parse_builtin_command(input: &str) -> Option<BuiltinCommand> {
 
     if input == ":doctor" {
         return Some(BuiltinCommand::Doctor);
+    }
+
+    if input == ":policy show" {
+        return Some(BuiltinCommand::PolicyShow);
     }
 
     if input == ":set dry-run on" {
@@ -173,8 +206,36 @@ fn parse_builtin_command(input: &str) -> Option<BuiltinCommand> {
         return Some(BuiltinCommand::HistoryRanked);
     }
 
+    if input == ":history top" {
+        return Some(BuiltinCommand::HistoryTop(None));
+    }
+
+    if let Some(count) = input.strip_prefix(":history top ") {
+        return Some(BuiltinCommand::HistoryTop(Some(count.trim().to_owned())));
+    }
+
+    if input == ":history recent" {
+        return Some(BuiltinCommand::HistoryRecent(None));
+    }
+
+    if let Some(count) = input.strip_prefix(":history recent ") {
+        return Some(BuiltinCommand::HistoryRecent(Some(count.trim().to_owned())));
+    }
+
     if let Some(command) = input.strip_prefix(":history add ") {
         return Some(BuiltinCommand::HistoryAdd(command.to_owned()));
+    }
+
+    if let Some(query) = input.strip_prefix(":history search ") {
+        return Some(BuiltinCommand::HistorySearch(query.trim().to_owned()));
+    }
+
+    if let Some(index) = input.strip_prefix(":history edit ") {
+        return Some(BuiltinCommand::HistoryEdit(index.trim().to_owned()));
+    }
+
+    if let Some(index) = input.strip_prefix(":history run ") {
+        return Some(BuiltinCommand::HistoryRun(index.trim().to_owned()));
     }
 
     if let Some(index) = input.strip_prefix(":history pin ") {
@@ -357,7 +418,10 @@ fn run_doctor(config: &AppConfig, shortcuts_file: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prompt_yes_no(message: &str, default_yes: bool) -> anyhow::Result<bool> {
+fn prompt_yes_no(message: &str, default_yes: bool, auto_yes: bool) -> anyhow::Result<bool> {
+    if auto_yes {
+        return Ok(true);
+    }
     print!("{message}");
     io::stdout().flush()?;
     let mut input = String::new();
@@ -369,12 +433,16 @@ fn prompt_yes_no(message: &str, default_yes: bool) -> anyhow::Result<bool> {
     Ok(response == "y" || response == "yes")
 }
 
-fn preview_command(command: &str) -> anyhow::Result<bool> {
+fn preview_command(command: &str, auto_yes: bool) -> anyhow::Result<bool> {
     println!("Preview: {command}");
-    prompt_yes_no("Run this command? [Y/n]: ", true)
+    prompt_yes_no("Run this command? [Y/n]: ", true, auto_yes)
 }
 
-fn approve_command(command: &str, safety_policy: SafetyPolicy) -> anyhow::Result<bool> {
+fn approve_command(
+    command: &str,
+    safety_policy: SafetyPolicy,
+    auto_yes: bool,
+) -> anyhow::Result<bool> {
     if !is_dangerous(command) {
         return Ok(true);
     }
@@ -387,6 +455,7 @@ fn approve_command(command: &str, safety_policy: SafetyPolicy) -> anyhow::Result
         SafetyPolicy::Confirm => prompt_yes_no(
             &format!("Warning: '{command}' looks dangerous. Continue? [y/N]: "),
             false,
+            auto_yes,
         ),
         SafetyPolicy::Block => {
             if command.contains("--force") {
@@ -400,9 +469,17 @@ fn approve_command(command: &str, safety_policy: SafetyPolicy) -> anyhow::Result
     }
 }
 
-fn enforce_prod_phrase_for_dangerous(command: &str, tags: &[String]) -> anyhow::Result<bool> {
+fn enforce_prod_phrase_for_dangerous(
+    command: &str,
+    tags: &[String],
+    auto_yes: bool,
+) -> anyhow::Result<bool> {
     let is_prod = tags.iter().any(|tag| tag.eq_ignore_ascii_case("prod"));
     if !is_prod || !is_dangerous(command) {
+        return Ok(true);
+    }
+
+    if auto_yes {
         return Ok(true);
     }
 
@@ -453,6 +530,7 @@ fn builtin_help_text() -> String {
     [
         "Built-in commands (reserved ':' namespace):",
         "  :doctor                                       Validate config and data files",
+        "  :policy show                                  Show execution policy for active profile",
         "  :set dry-run on|off                           Toggle dry-run mode",
         "  :profile list                                 List available profiles",
         "  :profile use <name>                           Switch active profile",
@@ -463,7 +541,12 @@ fn builtin_help_text() -> String {
         "  :shortcuts del <name>                 Delete shortcut",
         "  :history   | :h                               List persisted history",
         "  :history ranked                               List ranked by recency + frequency",
+        "  :history top [count]                          List most frequently used history",
+        "  :history recent [count]                       List most recent history entries",
         "  :history add <command>                        Add a history entry",
+        "  :history search <text>                        Search history entries",
+        "  :history edit <index>                         Edit and optionally run an entry",
+        "  :history run <index>                          Run a history entry by index",
         "  :history del <index> | <start-end>            Delete one/range of history entries",
         "  :history pin <index>                          Pin a history entry",
         "  :history unpin <index>                        Unpin a history entry",
@@ -478,6 +561,12 @@ fn builtin_help_text() -> String {
         "  :exit | :quit | :q                           Exit qc",
         "  :reload | :r                                  Reload config and shortcuts",
         "  :help | :?                                    Show this help",
+        "",
+        "Shell-style commands:",
+        "  cd [path] | cd ~ | cd -                       Change current directory",
+        "  pushd [path] | popd                           Navigate with directory stack",
+        "  dirs | clear dirs                             Show or clear directory stack",
+        "  pwd                                           Print current directory",
     ]
     .join("\n")
 }
@@ -726,56 +815,119 @@ fn import_state(path: impl AsRef<Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandExecutionStatus {
+    Executed,
+    DryRun,
+    Blocked,
+    Failed,
+}
+
+impl CommandExecutionStatus {
+    fn should_record_history(self) -> bool {
+        matches!(self, Self::Executed | Self::DryRun)
+    }
+
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Executed | Self::DryRun => EXIT_CODE_SUCCESS,
+            Self::Blocked => EXIT_CODE_BLOCKED,
+            Self::Failed => EXIT_CODE_FAILED,
+        }
+    }
+}
+
+fn command_matches_pattern(command: &str, patterns: &[String]) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    patterns
+        .iter()
+        .find(|pattern| !pattern.trim().is_empty() && lower.contains(&pattern.to_ascii_lowercase()))
+        .cloned()
+}
+
 fn run_executable_command(
     command: &str,
     config: &AppConfig,
     tags: &[String],
-) -> anyhow::Result<bool> {
+    auto_yes: bool,
+) -> anyhow::Result<CommandExecutionStatus> {
+    let policy = config.policy_for_profile(&config.active_profile);
+
+    if let Some(deny) = command_matches_pattern(command, &policy.deny_patterns) {
+        append_audit_log(&config.active_profile, "aborted-policy-deny", command)?;
+        println!("Blocked by execution policy deny pattern: {deny}");
+        return Ok(CommandExecutionStatus::Blocked);
+    }
+
+    let allow_match = if policy.allow_patterns.is_empty() {
+        None
+    } else {
+        command_matches_pattern(command, &policy.allow_patterns)
+    };
+
+    if !policy.allow_patterns.is_empty() && allow_match.is_none() {
+        append_audit_log(&config.active_profile, "aborted-policy-allow", command)?;
+        println!(
+            "Blocked by execution policy: command did not match allow patterns: {}",
+            policy.allow_patterns.join(", ")
+        );
+        return Ok(CommandExecutionStatus::Blocked);
+    }
+
+    if let Some(pattern) = allow_match {
+        println!("Execution policy allow pattern matched: {pattern}");
+    }
+
     if config.dry_run {
-        if !preview_command(command)? {
+        if !preview_command(command, auto_yes)? {
             append_audit_log(&config.active_profile, "aborted-preview", command)?;
             println!("  Aborted.");
-            return Ok(false);
+            return Ok(CommandExecutionStatus::Blocked);
         }
         println!("Dry-run enabled; command not executed.");
         append_audit_log(&config.active_profile, "dry-run", command)?;
-        return Ok(true);
+        return Ok(CommandExecutionStatus::DryRun);
     }
 
-    if !enforce_prod_phrase_for_dangerous(command, tags)? {
+    if !enforce_prod_phrase_for_dangerous(command, tags, auto_yes)? {
         append_audit_log(&config.active_profile, "aborted-prod-phrase", command)?;
         println!("  Aborted.");
-        return Ok(false);
+        return Ok(CommandExecutionStatus::Blocked);
     }
 
-    if !approve_command(command, config.safety_policy)? {
+    if !approve_command(command, config.safety_policy, auto_yes)? {
         append_audit_log(&config.active_profile, "aborted-safety", command)?;
         println!("  Aborted.");
-        return Ok(false);
+        return Ok(CommandExecutionStatus::Blocked);
     }
 
     if let Err(error) = run_command(command) {
         append_audit_log(&config.active_profile, "failed", command)?;
         eprintln!("{error:#}");
+        return Ok(CommandExecutionStatus::Failed);
     } else {
         append_audit_log(&config.active_profile, "ok", command)?;
     }
 
     increment_usage(HISTORY_USAGE_FILE, command)?;
-    Ok(true)
+    Ok(CommandExecutionStatus::Executed)
 }
 
-fn execute_shortcut(shortcut: &Shortcut, config: &AppConfig) -> anyhow::Result<bool> {
+fn execute_shortcut(
+    shortcut: &Shortcut,
+    config: &AppConfig,
+    auto_yes: bool,
+) -> anyhow::Result<CommandExecutionStatus> {
     let command = match prompt_for_args(&shortcut.command, PLACEHOLDER_VALUES_FILE) {
         Ok(cmd) => cmd,
         Err(e) => {
             eprintln!("{e:#}");
-            return Ok(false);
+            return Ok(CommandExecutionStatus::Blocked);
         }
     };
 
     println!("Running {} -> {}", shortcut.name, command);
-    run_executable_command(&command, config, &shortcut.tags)
+    run_executable_command(&command, config, &shortcut.tags, auto_yes)
 }
 
 fn print_history(entries: &[String], pins: &[String], usage: &HashMap<String, u64>) {
@@ -822,6 +974,19 @@ fn parse_history_range(value: &str) -> Option<(usize, usize)> {
     Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
 }
 
+fn parse_optional_count(count: &Option<String>, default: usize) -> anyhow::Result<usize> {
+    match count {
+        Some(raw) => {
+            let parsed = raw.trim().parse::<usize>()?;
+            if parsed == 0 {
+                bail!("Count must be greater than 0");
+            }
+            Ok(parsed)
+        }
+        None => Ok(default),
+    }
+}
+
 fn refresh_runtime_state(
     shortcuts: &[Shortcut],
     shared_hints: &SharedHints,
@@ -836,9 +1001,172 @@ fn handle_script_shortcut_command(input: &str) -> bool {
     parse_builtin_command(input).is_some()
 }
 
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn resolve_cd_target(raw_target: &str, previous_dir: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let target = raw_target.trim().trim_matches('"');
+
+    if target.is_empty() || target == "~" {
+        if let Some(home) = home_dir() {
+            return Ok(home);
+        }
+        bail!("Home directory is not available")
+    }
+
+    if target == "-" {
+        if let Some(previous) = previous_dir.clone() {
+            return Ok(previous);
+        }
+        bail!("No previous directory to switch to")
+    }
+
+    if let Some(rest) = target.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return Ok(home.join(rest));
+    }
+
+    if let Some(rest) = target.strip_prefix("~\\")
+        && let Some(home) = home_dir()
+    {
+        return Ok(home.join(rest));
+    }
+
+    Ok(PathBuf::from(target))
+}
+
+fn handle_shell_navigation_command(
+    input: &str,
+    previous_dir: &mut Option<PathBuf>,
+    dir_stack: &mut Vec<PathBuf>,
+) -> anyhow::Result<bool> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("pwd") {
+        println!("{}", env::current_dir()?.display());
+        return Ok(true);
+    }
+
+    if trimmed.eq_ignore_ascii_case("dirs") {
+        println!("  0 {}", env::current_dir()?.display());
+        for (index, path) in dir_stack.iter().rev().enumerate() {
+            println!("  {} {}", index + 1, path.display());
+        }
+        if dir_stack.is_empty() {
+            println!("  (directory stack is empty)");
+        }
+        return Ok(true);
+    }
+
+    if trimmed.eq_ignore_ascii_case("clear dirs") {
+        dir_stack.clear();
+        println!("Directory stack cleared.");
+        return Ok(true);
+    }
+
+    if let Some(raw_target) = trimmed.strip_prefix("pushd") {
+        if raw_target
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            return Ok(false);
+        }
+
+        let target = resolve_cd_target(raw_target, previous_dir)?;
+        let current = env::current_dir()?;
+        env::set_current_dir(&target)
+            .with_context(|| format!("Failed to change directory to {}", target.display()))?;
+        dir_stack.push(current.clone());
+        *previous_dir = Some(current);
+        println!("{}", env::current_dir()?.display());
+        return Ok(true);
+    }
+
+    if trimmed.eq_ignore_ascii_case("popd") {
+        let Some(target) = dir_stack.pop() else {
+            bail!("Directory stack is empty")
+        };
+
+        let current = env::current_dir()?;
+        env::set_current_dir(&target)
+            .with_context(|| format!("Failed to change directory to {}", target.display()))?;
+        *previous_dir = Some(current);
+        println!("{}", env::current_dir()?.display());
+        return Ok(true);
+    }
+
+    let Some(raw_target) = trimmed.strip_prefix("cd") else {
+        return Ok(false);
+    };
+
+    if raw_target
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace())
+    {
+        return Ok(false);
+    }
+
+    let target = resolve_cd_target(raw_target, previous_dir)?;
+    let current = env::current_dir()?;
+    env::set_current_dir(&target)
+        .with_context(|| format!("Failed to change directory to {}", target.display()))?;
+    *previous_dir = Some(current);
+    Ok(true)
+}
+
 enum BuiltinOutcome {
     Continue,
     Exit,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CliOptions {
+    command: Option<String>,
+    profile_override: Option<String>,
+    dry_run_override: bool,
+    assume_yes: bool,
+}
+
+fn parse_cli_options(args: &[String]) -> anyhow::Result<CliOptions> {
+    let mut options = CliOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--profile" => {
+                let Some(value) = args.get(index + 1) else {
+                    bail!("--profile requires a value")
+                };
+                if value.trim().is_empty() {
+                    bail!("--profile value must be non-empty");
+                }
+                options.profile_override = Some(value.to_owned());
+                index += 2;
+            }
+            "--dry-run" => {
+                options.dry_run_override = true;
+                index += 1;
+            }
+            "--yes" => {
+                options.assume_yes = true;
+                index += 1;
+            }
+            arg if arg.starts_with("--") => {
+                bail!("Unknown option: {arg}");
+            }
+            _ => {
+                options.command = Some(args[index..].join(" "));
+                break;
+            }
+        }
+    }
+
+    Ok(options)
 }
 
 fn maybe_backup(scripted: bool, paths: &[&str]) -> anyhow::Result<()> {
@@ -852,8 +1180,11 @@ fn maybe_backup(scripted: bool, paths: &[&str]) -> anyhow::Result<()> {
 fn execute_builtin(
     command: BuiltinCommand,
     scripted: bool,
+    auto_yes: bool,
+    script_exit_code: &mut i32,
     config: &mut AppConfig,
     history_limit: &mut crate::config::HistoryLimit,
+    active_profile_for_prompt: &SharedActiveProfile,
     shortcuts_file: &mut String,
     shortcuts: &mut Vec<Shortcut>,
     sc_names: &mut Vec<String>,
@@ -867,6 +1198,21 @@ fn execute_builtin(
         }
         BuiltinCommand::Doctor => {
             run_doctor(config, shortcuts_file.as_str())?;
+            Ok(BuiltinOutcome::Continue)
+        }
+        BuiltinCommand::PolicyShow => {
+            let policy = config.policy_for_profile(&config.active_profile);
+            println!("Execution policy for profile '{}':", config.active_profile);
+            if policy.allow_patterns.is_empty() {
+                println!("  allow: (none)");
+            } else {
+                println!("  allow: {}", policy.allow_patterns.join(", "));
+            }
+            if policy.deny_patterns.is_empty() {
+                println!("  deny : (none)");
+            } else {
+                println!("  deny : {}", policy.deny_patterns.join(", "));
+            }
             Ok(BuiltinOutcome::Continue)
         }
         BuiltinCommand::SetDryRun(enabled) => {
@@ -889,6 +1235,12 @@ fn execute_builtin(
             }
 
             config.active_profile = profile.to_owned();
+            {
+                let mut active = active_profile_for_prompt
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner());
+                *active = profile.to_owned();
+            }
             *shortcuts_file = shortcuts_file_for_profile(profile);
             *shortcuts = load_shortcuts(shortcuts_file.as_str()).unwrap_or_default();
             *sc_names = shortcut_names(shortcuts);
@@ -921,6 +1273,12 @@ fn execute_builtin(
                 Ok(new_config) => {
                     *config = new_config;
                     *history_limit = config.history_limit();
+                    {
+                        let mut active = active_profile_for_prompt
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *active = config.active_profile.clone();
+                    }
                     *shortcuts_file = shortcuts_file_for_profile(&config.active_profile);
                 }
                 Err(e) => eprintln!("Failed to reload config: {e:#}"),
@@ -1038,6 +1396,38 @@ fn execute_builtin(
             print_ranked_history(&entries, &usage);
             Ok(BuiltinOutcome::Continue)
         }
+        BuiltinCommand::HistoryTop(count) => {
+            match parse_optional_count(&count, 10) {
+                Ok(limit) => {
+                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let usage = load_usage(HISTORY_USAGE_FILE).unwrap_or_default();
+                    let mut ranked = entries
+                        .iter()
+                        .map(|entry| (entry.clone(), usage.get(entry).copied().unwrap_or(0)))
+                        .collect::<Vec<_>>();
+                    ranked.sort_by_key(|(_, hits)| std::cmp::Reverse(*hits));
+
+                    for (index, (entry, hits)) in ranked.into_iter().take(limit).enumerate() {
+                        println!("  {:>3} [{}] {}", index + 1, hits, entry);
+                    }
+                }
+                Err(e) => eprintln!("{e:#}"),
+            }
+            Ok(BuiltinOutcome::Continue)
+        }
+        BuiltinCommand::HistoryRecent(count) => {
+            match parse_optional_count(&count, 10) {
+                Ok(limit) => {
+                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let start = entries.len().saturating_sub(limit);
+                    for (offset, entry) in entries.iter().skip(start).enumerate() {
+                        println!("  {:>3} {}", start + offset + 1, entry);
+                    }
+                }
+                Err(e) => eprintln!("{e:#}"),
+            }
+            Ok(BuiltinOutcome::Continue)
+        }
         BuiltinCommand::HistoryAdd(command) => {
             maybe_backup(
                 scripted,
@@ -1061,6 +1451,91 @@ fn execute_builtin(
                     refresh_hints(shared_hints, sc_names, &history_entries);
                 }
                 Err(e) => eprintln!("{e:#}"),
+            }
+            Ok(BuiltinOutcome::Continue)
+        }
+        BuiltinCommand::HistorySearch(query) => {
+            let query = query.trim();
+            if query.is_empty() {
+                eprintln!("Expected ':history search <text>'");
+                return Ok(BuiltinOutcome::Continue);
+            }
+
+            let needle = query.to_ascii_lowercase();
+            let mut found = false;
+            for (index, entry) in load_history(HISTORY_FILE)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                if entry.to_ascii_lowercase().contains(&needle) {
+                    found = true;
+                    println!("  {:>3} {}", index + 1, entry);
+                }
+            }
+
+            if !found {
+                println!("  (no results)");
+            }
+
+            Ok(BuiltinOutcome::Continue)
+        }
+        BuiltinCommand::HistoryEdit(index) => {
+            match index.trim().parse::<usize>() {
+                Ok(one_based_index) => {
+                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    if one_based_index == 0 || one_based_index > entries.len() {
+                        eprintln!("History index out of range.");
+                        return Ok(BuiltinOutcome::Continue);
+                    }
+
+                    let existing = entries[one_based_index - 1].clone();
+                    println!("Current: {existing}");
+                    print!("Edited command (empty to cancel): ");
+                    io::stdout().flush()?;
+
+                    let mut edited = String::new();
+                    io::stdin().read_line(&mut edited)?;
+                    let edited = edited.trim();
+                    if edited.is_empty() {
+                        println!("Cancelled.");
+                        return Ok(BuiltinOutcome::Continue);
+                    }
+
+                    let status = run_executable_command(edited, config, &[], auto_yes)?;
+                    if scripted {
+                        *script_exit_code = status.exit_code();
+                    }
+                    if status.should_record_history() {
+                        let history_entries = append_history(HISTORY_FILE, edited, *history_limit)?;
+                        refresh_hints(shared_hints, sc_names, &history_entries);
+                    }
+                }
+                Err(_) => eprintln!("Expected ':history edit <index>' with a numeric index."),
+            }
+            Ok(BuiltinOutcome::Continue)
+        }
+        BuiltinCommand::HistoryRun(index) => {
+            match index.trim().parse::<usize>() {
+                Ok(one_based_index) => {
+                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    if one_based_index == 0 || one_based_index > entries.len() {
+                        eprintln!("History index out of range.");
+                        return Ok(BuiltinOutcome::Continue);
+                    }
+
+                    let command = entries[one_based_index - 1].clone();
+                    let status = run_executable_command(&command, config, &[], auto_yes)?;
+                    if scripted {
+                        *script_exit_code = status.exit_code();
+                    }
+                    if status.should_record_history() {
+                        let history_entries =
+                            append_history(HISTORY_FILE, &command, *history_limit)?;
+                        refresh_hints(shared_hints, sc_names, &history_entries);
+                    }
+                }
+                Err(_) => eprintln!("Expected ':history run <index>' with a numeric index."),
             }
             Ok(BuiltinOutcome::Continue)
         }
@@ -1215,13 +1690,21 @@ fn execute_builtin(
                         match &last_find_results[one_based_index - 1] {
                             FindResult::Shortcut(shortcut_name) => {
                                 if let Some(shortcut) = find_shortcut(shortcuts, shortcut_name) {
-                                    let _ = execute_shortcut(shortcut, config)?;
+                                    let status = execute_shortcut(shortcut, config, auto_yes)?;
+                                    if scripted {
+                                        *script_exit_code = status.exit_code();
+                                    }
                                 } else {
                                     eprintln!("Shortcut no longer exists: {shortcut_name}");
                                 }
                             }
                             FindResult::History(command) => {
-                                if run_executable_command(command, config, &[])? {
+                                let status =
+                                    run_executable_command(command, config, &[], auto_yes)?;
+                                if scripted {
+                                    *script_exit_code = status.exit_code();
+                                }
+                                if status.should_record_history() {
                                     let history_entries =
                                         append_history(HISTORY_FILE, command, *history_limit)?;
                                     refresh_hints(shared_hints, sc_names, &history_entries);
@@ -1317,11 +1800,18 @@ fn execute_builtin(
                 Ok(index) if index > 0 && index <= choices.len() => match &choices[index - 1] {
                     FindResult::Shortcut(name) => {
                         if let Some(shortcut) = find_shortcut(shortcuts, name) {
-                            let _ = execute_shortcut(shortcut, config)?;
+                            let status = execute_shortcut(shortcut, config, auto_yes)?;
+                            if scripted {
+                                *script_exit_code = status.exit_code();
+                            }
                         }
                     }
                     FindResult::History(command) => {
-                        if run_executable_command(command, config, &[])? {
+                        let status = run_executable_command(command, config, &[], auto_yes)?;
+                        if scripted {
+                            *script_exit_code = status.exit_code();
+                        }
+                        if status.should_record_history() {
                             let history_entries =
                                 append_history(HISTORY_FILE, command, *history_limit)?;
                             refresh_hints(shared_hints, sc_names, &history_entries);
@@ -1369,6 +1859,12 @@ fn execute_builtin(
                 Ok(()) => {
                     *config = load_config(CONFIG_FILE)?;
                     *history_limit = config.history_limit();
+                    {
+                        let mut active = active_profile_for_prompt
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *active = config.active_profile.clone();
+                    }
                     *shortcuts_file = shortcuts_file_for_profile(&config.active_profile);
                     *shortcuts = load_shortcuts(shortcuts_file.as_str()).unwrap_or_default();
                     *sc_names = shortcut_names(shortcuts);
@@ -1390,6 +1886,12 @@ fn execute_builtin(
                 Ok(()) => {
                     *config = load_config(CONFIG_FILE)?;
                     *history_limit = config.history_limit();
+                    {
+                        let mut active = active_profile_for_prompt
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *active = config.active_profile.clone();
+                    }
                     *shortcuts_file = shortcuts_file_for_profile(&config.active_profile);
                     *shortcuts = load_shortcuts(shortcuts_file.as_str()).unwrap_or_default();
                     *sc_names = shortcut_names(shortcuts);
@@ -1428,6 +1930,10 @@ mod tests {
         assert_eq!(parse_builtin_command(":quit"), Some(BuiltinCommand::Exit));
         assert_eq!(parse_builtin_command(":r"), Some(BuiltinCommand::Reload));
         assert_eq!(
+            parse_builtin_command(":policy show"),
+            Some(BuiltinCommand::PolicyShow)
+        );
+        assert_eq!(
             parse_builtin_command(":s"),
             Some(BuiltinCommand::ShortcutsList)
         );
@@ -1452,6 +1958,30 @@ mod tests {
             Some(BuiltinCommand::HistoryDel("2-5".to_owned()))
         );
         assert_eq!(
+            parse_builtin_command(":history run 3"),
+            Some(BuiltinCommand::HistoryRun("3".to_owned()))
+        );
+        assert_eq!(
+            parse_builtin_command(":history top"),
+            Some(BuiltinCommand::HistoryTop(None))
+        );
+        assert_eq!(
+            parse_builtin_command(":history top 5"),
+            Some(BuiltinCommand::HistoryTop(Some("5".to_owned())))
+        );
+        assert_eq!(
+            parse_builtin_command(":history recent 7"),
+            Some(BuiltinCommand::HistoryRecent(Some("7".to_owned())))
+        );
+        assert_eq!(
+            parse_builtin_command(":history search kubectl"),
+            Some(BuiltinCommand::HistorySearch("kubectl".to_owned()))
+        );
+        assert_eq!(
+            parse_builtin_command(":history edit 2"),
+            Some(BuiltinCommand::HistoryEdit("2".to_owned()))
+        );
+        assert_eq!(
             parse_builtin_command(":find run 3"),
             Some(BuiltinCommand::Find("run 3".to_owned()))
         );
@@ -1474,11 +2004,25 @@ mod tests {
         assert!(snapshot.contains(":profile use <name>"));
         assert!(snapshot.contains(":find! <text>"));
         assert!(snapshot.contains(":exit | :quit | :q"));
+        assert!(snapshot.contains("dirs | clear dirs"));
+        assert!(snapshot.contains(":history top [count]"));
+        assert!(snapshot.contains(":history recent [count]"));
+        assert!(snapshot.contains(":policy show"));
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli_args = env::args().skip(1).collect::<Vec<_>>();
+    let cli = parse_cli_options(&cli_args)?;
+
     let mut config = load_config(CONFIG_FILE)?;
+    if let Some(profile) = &cli.profile_override {
+        config.active_profile = profile.clone();
+    }
+    if cli.dry_run_override {
+        config.dry_run = true;
+    }
+
     let mut history_limit = config.history_limit();
     let mut shortcuts_file = shortcuts_file_for_profile(&config.active_profile);
     let mut shortcuts = load_shortcuts(&shortcuts_file).unwrap_or_else(|e| {
@@ -1510,17 +2054,31 @@ fn main() -> anyhow::Result<()> {
         .with_hinter(Box::new(hinter))
         .with_highlighter(Box::new(highlighter));
 
-    let prompt = CmdStylePrompt;
+    let active_profile_for_prompt: SharedActiveProfile =
+        Arc::new(RwLock::new(config.active_profile.clone()));
+    let prompt = CmdStylePrompt::new(Arc::clone(&active_profile_for_prompt));
     let mut last_find_results: Vec<FindResult> = Vec::new();
+    let mut previous_dir: Option<PathBuf> = None;
+    let mut dir_stack: Vec<PathBuf> = Vec::new();
 
-    let args = env::args().collect::<Vec<_>>();
-    if args.len() > 1 {
-        let scripted = args[1..].join(" ");
+    if let Some(scripted) = cli.command.clone() {
         if !scripted.starts_with(':') {
-            run_executable_command(&scripted, &config, &[])?;
-            let history_entries = append_history(HISTORY_FILE, &scripted, history_limit)?;
-            refresh_hints(&shared_hints, &sc_names, &history_entries);
-            return Ok(());
+            match handle_shell_navigation_command(&scripted, &mut previous_dir, &mut dir_stack) {
+                Ok(true) => {
+                    process::exit(EXIT_CODE_SUCCESS);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    process::exit(EXIT_CODE_FAILED);
+                }
+            }
+            let status = run_executable_command(&scripted, &config, &[], cli.assume_yes)?;
+            if status.should_record_history() {
+                let history_entries = append_history(HISTORY_FILE, &scripted, history_limit)?;
+                refresh_hints(&shared_hints, &sc_names, &history_entries);
+            }
+            process::exit(status.exit_code());
         }
 
         if !handle_script_shortcut_command(&scripted) {
@@ -1530,18 +2088,22 @@ fn main() -> anyhow::Result<()> {
         let Some(command) = parse_builtin_command(&scripted) else {
             bail!("Unsupported script command: {scripted}");
         };
+        let mut script_exit_code = EXIT_CODE_SUCCESS;
         let _ = execute_builtin(
             command,
             true,
+            cli.assume_yes,
+            &mut script_exit_code,
             &mut config,
             &mut history_limit,
+            &active_profile_for_prompt,
             &mut shortcuts_file,
             &mut shortcuts,
             &mut sc_names,
             &shared_hints,
             &mut last_find_results,
         )?;
-        return Ok(());
+        process::exit(script_exit_code);
     }
 
     loop {
@@ -1554,11 +2116,15 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if let Some(command) = parse_builtin_command(input) {
+                    let mut interactive_exit_code = EXIT_CODE_SUCCESS;
                     match execute_builtin(
                         command,
                         false,
+                        false,
+                        &mut interactive_exit_code,
                         &mut config,
                         &mut history_limit,
+                        &active_profile_for_prompt,
                         &mut shortcuts_file,
                         &mut shortcuts,
                         &mut sc_names,
@@ -1571,17 +2137,28 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // ── Shortcut or raw command ──────────────────────────────────────
+                match handle_shell_navigation_command(input, &mut previous_dir, &mut dir_stack) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("{e:#}");
+                        continue;
+                    }
+                }
+
                 if let Some(shortcut) = find_shortcut(&shortcuts, input) {
-                    let _ = execute_shortcut(shortcut, &config)?;
+                    let _ = execute_shortcut(shortcut, &config, false)?;
                 } else {
-                    match run_executable_command(input, &config, &[]) {
-                        Ok(true) => match append_history(HISTORY_FILE, input, history_limit) {
-                            Ok(history_entries) => {
-                                refresh_hints(&shared_hints, &sc_names, &history_entries);
+                    match run_executable_command(input, &config, &[], false) {
+                        Ok(status) if status.should_record_history() => {
+                            match append_history(HISTORY_FILE, input, history_limit) {
+                                Ok(history_entries) => {
+                                    refresh_hints(&shared_hints, &sc_names, &history_entries);
+                                }
+                                Err(error) => eprintln!("{error:#}"),
                             }
-                            Err(error) => eprintln!("{error:#}"),
-                        },
-                        Ok(false) => {}
+                        }
+                        Ok(_status) => {}
                         Err(error) => eprintln!("{error:#}"),
                     }
                 }

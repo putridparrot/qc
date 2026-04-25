@@ -29,6 +29,7 @@ It lets you:
 - Built-in commands:
   - `:help` / `:?`
   - `:doctor`
+  - `:policy show`
   - `:set dry-run on|off`
   - `:profile list`
   - `:profile use <name>`
@@ -39,7 +40,12 @@ It lets you:
   - `:shortcuts del <name>`
   - `:history` / `:h`
   - `:history ranked`
+  - `:history top [count]`
+  - `:history recent [count]`
   - `:history add <command>`
+  - `:history search <text>`
+  - `:history edit <index>`
+  - `:history run <index>`
   - `:history pin <index>` / `:history unpin <index>`
   - `:history del <index>` / `:history del <start-end>`
   - `:history dedupe`
@@ -121,6 +127,8 @@ At the prompt:
 - entering any other text runs it as a raw shell command
 - raw commands are appended to `history.txt` if history is enabled
 - shortcuts are not written to `history.txt`
+- shell-style navigation is supported with `cd`, `cd -`, `cd ~`, `pushd`, `popd`, `dirs`, `clear dirs`, and `pwd`
+- prompt includes the active profile and current folder, for example `QC [default] d:\\Development\\putridparrot\\qc>`
 
 ## Usage
 
@@ -218,6 +226,16 @@ Example:
 :shortcuts del kube-ns
 ```
 
+### `:policy show`
+
+Shows the effective execution policy for the active profile, including allow and deny patterns.
+
+Example:
+
+```text
+:policy show
+```
+
 ### `:history` / `:h`
 
 Prints the current contents of `history.txt` with line numbers.
@@ -230,6 +248,56 @@ Example:
 
 ```text
 :history add kubectl get pods -A
+```
+
+### `:history run <index>`
+
+Runs a history entry by its 1-based index from `:history`.
+
+Example:
+
+```text
+:history run 3
+```
+
+### `:history top [count]`
+
+Prints highest-frequency history entries (default 10).
+
+Example:
+
+```text
+:history top 5
+```
+
+### `:history recent [count]`
+
+Prints the most recent history entries (default 10).
+
+Example:
+
+```text
+:history recent 8
+```
+
+### `:history search <text>`
+
+Searches history entries with a case-insensitive substring match.
+
+Example:
+
+```text
+:history search kubectl
+```
+
+### `:history edit <index>`
+
+Loads a history entry by index, lets you edit it, and can run the edited command.
+
+Example:
+
+```text
+:history edit 4
 ```
 
 ### `:history ranked`
@@ -293,6 +361,52 @@ Reloads:
 - the in-memory hint list
 
 Use this after editing config or shortcut definitions while `qc` is still running.
+
+## Script Flags
+
+`qc` supports non-interactive options before the command:
+
+- `--profile <name>` use a profile for this invocation
+- `--dry-run` force dry-run mode for this invocation
+- `--yes` auto-approve confirmation prompts
+
+Examples:
+
+```text
+qc --profile prod --dry-run --yes kubectl get pods -A
+qc --profile dev :history run 3
+```
+
+### Script Exit Codes
+
+- `0` success
+- `20` blocked by policy/safety prompt rejection
+- `30` execution failed
+
+## Execution Policy (Per Profile)
+
+You can add optional command allow/deny patterns in `config.txt`:
+
+```text
+policy.prod.allow=kubectl,az
+policy.prod.deny=rm -rf,drop table
+```
+
+Behavior:
+
+- deny patterns always block when matched
+- if allow patterns are configured for the active profile, command text must match at least one
+
+### Shell-Style Navigation Commands
+
+- `cd [path]` change directory
+- `cd ~` change to home directory
+- `cd -` switch to previous directory
+- `pushd [path]` change directory and push previous directory onto stack
+- `popd` change directory to the last pushed directory
+- `dirs` print current directory and stacked directories
+- `clear dirs` clear the directory stack
+- `pwd` print current directory
 
 ## Hinting And Highlighting
 
