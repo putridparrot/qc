@@ -767,7 +767,7 @@ fn print_ranked_history(entries: &[String], usage: &HashMap<String, u64>) {
         })
         .collect::<Vec<_>>();
 
-    ranked.sort_by(|left, right| right.1.cmp(&left.1));
+    ranked.sort_by_key(|item| std::cmp::Reverse(item.1));
 
     for (index, (entry, score, frequency, recency)) in ranked.iter().enumerate() {
         println!(
