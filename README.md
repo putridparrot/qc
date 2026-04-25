@@ -71,6 +71,40 @@ Or build a binary first:
 cargo build --release
 ```
 
+## Developer Setup (Consistent Lint/Test)
+
+This repo pins the Rust toolchain in `rust-toolchain.toml` so local formatting matches CI.
+
+To enable the repo's pre-commit hook checks:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The pre-commit hook runs:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-features --quiet`
+
+This helps catch formatting/lint/test issues before push.
+
+## Quick Start: Pinned History
+
+If you mainly want to speed up repeat commands, start with:
+
+```text
+:history
+:history pin 2
+:history ranked
+```
+
+What this does:
+
+- `:history` shows saved commands with indexes
+- `:history pin <index>` marks an important command with `*`
+- `:history ranked` surfaces high-value commands based on recency + frequency
+
 ## How It Works
 
 When `qc` starts, it loads:
@@ -198,6 +232,34 @@ Example:
 :history add kubectl get pods -A
 ```
 
+### `:history ranked`
+
+Prints history sorted by a combined score of frequency and recency.
+
+Use this to quickly find commands you run often without losing the benefit of recent activity.
+
+### `:history pin <index>`
+
+Pins a history entry by 1-based index from `:history`.
+
+Pinned entries are marked with `*` in `:history` output.
+
+Example:
+
+```text
+:history pin 2
+```
+
+### `:history unpin <index>`
+
+Unpins a previously pinned history entry.
+
+Example:
+
+```text
+:history unpin 2
+```
+
 ### `:history del <index>`
 
 Deletes a history entry by 1-based index as shown by `:history`.
@@ -207,6 +269,16 @@ Example:
 ```text
 :history del 3
 ```
+
+You can also delete a range:
+
+```text
+:history del 3-7
+```
+
+### `:history dedupe`
+
+Removes duplicate history entries while keeping the latest copy of each command.
 
 ### `:history clear`
 
@@ -309,9 +381,23 @@ Important details:
 
 - only raw commands are stored
 - shortcut names are not stored
-- duplicate entries are ignored
+- duplicate entries are moved to the end on reuse (most recent wins)
 - history may be pruned on startup if it exceeds the configured limit
 - `:history` reads from the current file contents
+
+### Pinned And Ranked History
+
+- pins are stored in `history_pins.txt`
+- usage counters are stored in `history_usage.txt`
+- `:history` shows `*` for pinned entries
+- `:history ranked` uses both frequency and recency to compute score
+
+Typical flow:
+
+1. Use `:history` to find a command index.
+2. Run `:history pin <index>` to keep important commands easy to spot.
+3. Use `:history ranked` to surface high-value commands.
+4. Use `:history dedupe` occasionally to clean up repeated entries.
 
 ## Dangerous Command Confirmation
 

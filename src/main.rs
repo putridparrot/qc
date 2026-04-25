@@ -3,8 +3,8 @@ mod hinter;
 mod history;
 mod shortcuts;
 
-use std::collections::HashMap;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
