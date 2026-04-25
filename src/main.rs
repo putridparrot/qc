@@ -4,6 +4,7 @@ mod history;
 mod shortcuts;
 
 use std::collections::HashMap;
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -23,7 +24,7 @@ use crate::shortcuts::{
 };
 use anyhow::{Context, bail};
 use nu_ansi_term::{Color, Style};
-use reedline::{DefaultPrompt, Reedline, Signal};
+use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 const CONFIG_FILE: &str = "config.txt";
 const SHORTCUTS_FILE: &str = "shortcuts.txt";
@@ -35,6 +36,41 @@ const AUDIT_LOG_FILE: &str = "audit.log";
 const EXPORT_HEADER: &str = "# qc-export:v1";
 const BACKUP_DIR: &str = "backups";
 const LAST_BACKUP_FILE: &str = ".qc_last_backup";
+
+struct CmdStylePrompt;
+
+impl CmdStylePrompt {
+    fn current_dir_display() -> String {
+        env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| ".".to_owned())
+    }
+}
+
+impl Prompt for CmdStylePrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Owned(format!("{}>", Self::current_dir_display()))
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed(">> ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        _history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        Cow::Borrowed("history> ")
+    }
+}
 
 #[derive(Clone, Debug)]
 enum FindResult {
@@ -1474,7 +1510,7 @@ fn main() -> anyhow::Result<()> {
         .with_hinter(Box::new(hinter))
         .with_highlighter(Box::new(highlighter));
 
-    let prompt = DefaultPrompt::default();
+    let prompt = CmdStylePrompt;
     let mut last_find_results: Vec<FindResult> = Vec::new();
 
     let args = env::args().collect::<Vec<_>>();
