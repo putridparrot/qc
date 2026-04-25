@@ -1,0 +1,10 @@
+[package]
+name = "qc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+reedline = "0.40"
+nu-ansi-term = "0.50.3"
+rpassword = "7.3.1"

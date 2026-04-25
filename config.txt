@@ -1,0 +1,21 @@
+# Maximum number of non-shortcut commands to keep in history.txt
+# Use -1 to keep unlimited history.
+# Use 0 to disable history entirely.
+# Use a positive number to keep only the newest N items.
+max_history_items=100
+
+# Safety policy for dangerous commands:
+# warn    = print warning but continue
+# confirm = prompt before executing dangerous commands
+# block   = block dangerous commands unless command contains --force
+safety_policy=confirm
+
+# Dry-run mode:
+# true  = preview and validate commands but do not execute
+# false = execute normally
+dry_run=false
+
+# Active shortcut profile:
+# default uses shortcuts.txt
+# other values use shortcuts.<profile>.txt
+active_profile=default

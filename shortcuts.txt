@@ -1,0 +1,7 @@
+# name=command
+# Use {placeholder} to prompt for arguments at runtime.
+kube-dev[k8s,context]=kubectl config use-context dev-cluster
+kube-logs[k8s,debug]=kubectl logs deployment/{app} --follow
+kube-restart[k8s,deploy]=kubectl rollout restart deployment/{app}
+kube-exec[k8s,debug]=kubectl exec -it {pod} -- /bin/bash
+kube-tail[k8s,debug]=kubectl logs deployment/{app} -n {namespace?default} --tail={lines?200}

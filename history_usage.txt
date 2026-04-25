@@ -1,0 +1,2 @@
+kubectl config use-context dev-cluster=2
+kubectl rollout restart deployment/test=1

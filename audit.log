@@ -1,0 +1,4 @@
+1777146283|default|failed|kubectl config use-context dev-cluster
+1777146687|default|aborted-preview|kubectl config use-context dev-cluster
+1777146708|default|failed|kubectl config use-context dev-cluster
+1777146733|default|failed|kubectl rollout restart deployment/test
