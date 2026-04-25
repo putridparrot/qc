@@ -57,7 +57,7 @@ impl Prompt for CmdStylePrompt {
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Owned(format!("{}>", Self::current_dir_display()))
+        Cow::Owned(format!("QC {}>", Self::current_dir_display()))
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
