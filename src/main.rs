@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, bail};
 use crate::config::{AppConfig, SafetyPolicy, load_config, save_config};
 use crate::hinter::{HintHighlighter, SharedHints, ShortcutHinter};
 use crate::history::{
@@ -22,6 +21,7 @@ use crate::shortcuts::{
     Shortcut, add_shortcut_with_tags, delete_shortcut, filter_shortcuts_by_tag, find_shortcut,
     is_dangerous, load_shortcuts, prompt_for_args, run_command, shortcut_names,
 };
+use anyhow::{Context, bail};
 use nu_ansi_term::{Color, Style};
 use reedline::{DefaultPrompt, Reedline, Signal};
 
@@ -228,7 +228,13 @@ fn append_audit_log(profile: &str, status: &str, command: &str) -> anyhow::Resul
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let line = format!("{}|{}|{}|{}\n", ts, profile, status, command.replace('\n', " "));
+    let line = format!(
+        "{}|{}|{}|{}\n",
+        ts,
+        profile,
+        status,
+        command.replace('\n', " ")
+    );
     let mut existing = fs::read_to_string(AUDIT_LOG_FILE).unwrap_or_default();
     existing.push_str(&line);
     fs::write(AUDIT_LOG_FILE, existing)
@@ -237,16 +243,27 @@ fn append_audit_log(profile: &str, status: &str, command: &str) -> anyhow::Resul
 
 fn generate_completion_script(shell: &str, shortcut_names: &[String]) -> anyhow::Result<String> {
     let builtins = [
-        ":help", ":doctor", ":set", ":profile", ":completion", ":shortcuts", ":history",
-        ":find", ":find!", ":export", ":import", ":undo", ":reload", ":exit", ":quit", ":q",
+        ":help",
+        ":doctor",
+        ":set",
+        ":profile",
+        ":completion",
+        ":shortcuts",
+        ":history",
+        ":find",
+        ":find!",
+        ":export",
+        ":import",
+        ":undo",
+        ":reload",
+        ":exit",
+        ":quit",
+        ":q",
     ];
 
     match shell.to_ascii_lowercase().as_str() {
         "bash" => {
-            let mut words = builtins
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
+            let mut words = builtins.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             words.extend(shortcut_names.iter().cloned());
             Ok(format!(
                 "_qc_complete() {{\n  local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n  COMPREPLY=( $(compgen -W \"{}\" -- \"$cur\") )\n}}\ncomplete -F _qc_complete qc\n",
@@ -282,10 +299,16 @@ fn run_doctor(config: &AppConfig, shortcuts_file: &str) -> anyhow::Result<()> {
             println!("  shortcuts: ok ({} entries)", shortcuts.len());
             let prod_dangerous = shortcuts
                 .iter()
-                .filter(|s| s.tags.iter().any(|t| t.eq_ignore_ascii_case("prod")) && is_dangerous(&s.command))
+                .filter(|s| {
+                    s.tags.iter().any(|t| t.eq_ignore_ascii_case("prod"))
+                        && is_dangerous(&s.command)
+                })
                 .count();
             if prod_dangerous > 0 {
-                println!("  warning: {} prod-tagged shortcut(s) match dangerous patterns", prod_dangerous);
+                println!(
+                    "  warning: {} prod-tagged shortcut(s) match dangerous patterns",
+                    prod_dangerous
+                );
             }
         }
         Err(e) => println!("  shortcuts: error ({e:#})"),
@@ -325,12 +348,10 @@ fn approve_command(command: &str, safety_policy: SafetyPolicy) -> anyhow::Result
             println!("Warning: dangerous pattern detected.");
             Ok(true)
         }
-        SafetyPolicy::Confirm => {
-            prompt_yes_no(
-                &format!("Warning: '{command}' looks dangerous. Continue? [y/N]: "),
-                false,
-            )
-        }
+        SafetyPolicy::Confirm => prompt_yes_no(
+            &format!("Warning: '{command}' looks dangerous. Continue? [y/N]: "),
+            false,
+        ),
         SafetyPolicy::Block => {
             if command.contains("--force") {
                 println!("Dangerous command allowed because --force is present.");
@@ -457,7 +478,8 @@ fn write_string_set(path: impl AsRef<Path>, values: &[String]) -> anyhow::Result
     } else {
         format!("{}\n", values.join("\n"))
     };
-    fs::write(path, content).with_context(|| format!("Failed to write file: {}", path.display()))?;
+    fs::write(path, content)
+        .with_context(|| format!("Failed to write file: {}", path.display()))?;
     Ok(())
 }
 
@@ -668,7 +690,11 @@ fn import_state(path: impl AsRef<Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_executable_command(command: &str, config: &AppConfig, tags: &[String]) -> anyhow::Result<bool> {
+fn run_executable_command(
+    command: &str,
+    config: &AppConfig,
+    tags: &[String],
+) -> anyhow::Result<bool> {
     if config.dry_run {
         if !preview_command(command)? {
             append_audit_log(&config.active_profile, "aborted-preview", command)?;
@@ -703,10 +729,7 @@ fn run_executable_command(command: &str, config: &AppConfig, tags: &[String]) ->
     Ok(true)
 }
 
-fn execute_shortcut(
-    shortcut: &Shortcut,
-    config: &AppConfig,
-) -> anyhow::Result<bool> {
+fn execute_shortcut(shortcut: &Shortcut, config: &AppConfig) -> anyhow::Result<bool> {
     let command = match prompt_for_args(&shortcut.command, PLACEHOLDER_VALUES_FILE) {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -789,6 +812,7 @@ fn maybe_backup(scripted: bool, paths: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_builtin(
     command: BuiltinCommand,
     scripted: bool,
@@ -835,7 +859,10 @@ fn execute_builtin(
             save_config(CONFIG_FILE, config)?;
             let history_entries = load_history(HISTORY_FILE).unwrap_or_default();
             refresh_hints(shared_hints, sc_names, &history_entries);
-            println!("Active profile set to '{}' using {}", profile, shortcuts_file);
+            println!(
+                "Active profile set to '{}' using {}",
+                profile, shortcuts_file
+            );
             Ok(BuiltinOutcome::Continue)
         }
         BuiltinCommand::Completion(shell) => {
@@ -899,7 +926,12 @@ fn execute_builtin(
         BuiltinCommand::ShortcutsAdd(spec) => {
             maybe_backup(
                 scripted,
-                &[shortcuts_file.as_str(), HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    shortcuts_file.as_str(),
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             match parse_shortcut_add(&spec).and_then(|(name, tags, command)| {
@@ -927,7 +959,12 @@ fn execute_builtin(
         BuiltinCommand::ShortcutsDel(name) => {
             maybe_backup(
                 scripted,
-                &[shortcuts_file.as_str(), HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    shortcuts_file.as_str(),
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             let name = name.trim();
@@ -968,7 +1005,12 @@ fn execute_builtin(
         BuiltinCommand::HistoryAdd(command) => {
             maybe_backup(
                 scripted,
-                &[SHORTCUTS_FILE, HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    SHORTCUTS_FILE,
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             let command = command.trim();
@@ -989,7 +1031,12 @@ fn execute_builtin(
         BuiltinCommand::HistoryPin(index) => {
             maybe_backup(
                 scripted,
-                &[SHORTCUTS_FILE, HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    SHORTCUTS_FILE,
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             match index.trim().parse::<usize>() {
@@ -1014,7 +1061,12 @@ fn execute_builtin(
         BuiltinCommand::HistoryUnpin(index) => {
             maybe_backup(
                 scripted,
-                &[SHORTCUTS_FILE, HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    SHORTCUTS_FILE,
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             match index.trim().parse::<usize>() {
@@ -1042,7 +1094,12 @@ fn execute_builtin(
         BuiltinCommand::HistoryDel(index) => {
             maybe_backup(
                 scripted,
-                &[SHORTCUTS_FILE, HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    SHORTCUTS_FILE,
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             let index = index.trim();
@@ -1072,7 +1129,12 @@ fn execute_builtin(
         BuiltinCommand::HistoryDedupe => {
             maybe_backup(
                 scripted,
-                &[SHORTCUTS_FILE, HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    SHORTCUTS_FILE,
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             match dedupe_history(HISTORY_FILE) {
@@ -1087,7 +1149,12 @@ fn execute_builtin(
         BuiltinCommand::HistoryClear => {
             maybe_backup(
                 scripted,
-                &[SHORTCUTS_FILE, HISTORY_FILE, HISTORY_PINS_FILE, HISTORY_USAGE_FILE],
+                &[
+                    SHORTCUTS_FILE,
+                    HISTORY_FILE,
+                    HISTORY_PINS_FILE,
+                    HISTORY_USAGE_FILE,
+                ],
             )?;
 
             match clear_history(HISTORY_FILE) {
@@ -1119,7 +1186,8 @@ fn execute_builtin(
                             }
                             FindResult::History(command) => {
                                 if run_executable_command(command, config, &[])? {
-                                    let history_entries = append_history(HISTORY_FILE, command, *history_limit)?;
+                                    let history_entries =
+                                        append_history(HISTORY_FILE, command, *history_limit)?;
                                     refresh_hints(shared_hints, sc_names, &history_entries);
                                 }
                             }
@@ -1181,7 +1249,11 @@ fn execute_builtin(
                 .to_ascii_lowercase();
                 if haystack.contains(&needle) {
                     choices.push(FindResult::Shortcut(shortcut.name.clone()));
-                    println!("  {:>3} [shortcut] {}", choices.len(), format_shortcut(shortcut));
+                    println!(
+                        "  {:>3} [shortcut] {}",
+                        choices.len(),
+                        format_shortcut(shortcut)
+                    );
                 }
             }
             for entry in load_history(HISTORY_FILE).unwrap_or_default() {
@@ -1206,21 +1278,20 @@ fn execute_builtin(
                 return Ok(BuiltinOutcome::Continue);
             }
             match trimmed.parse::<usize>() {
-                Ok(index) if index > 0 && index <= choices.len() => {
-                    match &choices[index - 1] {
-                        FindResult::Shortcut(name) => {
-                            if let Some(shortcut) = find_shortcut(shortcuts, name) {
-                                let _ = execute_shortcut(shortcut, config)?;
-                            }
-                        }
-                        FindResult::History(command) => {
-                            if run_executable_command(command, config, &[])? {
-                                let history_entries = append_history(HISTORY_FILE, command, *history_limit)?;
-                                refresh_hints(shared_hints, sc_names, &history_entries);
-                            }
+                Ok(index) if index > 0 && index <= choices.len() => match &choices[index - 1] {
+                    FindResult::Shortcut(name) => {
+                        if let Some(shortcut) = find_shortcut(shortcuts, name) {
+                            let _ = execute_shortcut(shortcut, config)?;
                         }
                     }
-                }
+                    FindResult::History(command) => {
+                        if run_executable_command(command, config, &[])? {
+                            let history_entries =
+                                append_history(HISTORY_FILE, command, *history_limit)?;
+                            refresh_hints(shared_hints, sc_names, &history_entries);
+                        }
+                    }
+                },
                 _ => eprintln!("Invalid selection."),
             }
 
@@ -1287,7 +1358,10 @@ fn execute_builtin(
                     *shortcuts = load_shortcuts(shortcuts_file.as_str()).unwrap_or_default();
                     *sc_names = shortcut_names(shortcuts);
                     let history_entries = refresh_runtime_state(shortcuts, shared_hints)?;
-                    println!("Restored backup ({} history entries).", history_entries.len());
+                    println!(
+                        "Restored backup ({} history entries).",
+                        history_entries.len()
+                    );
                 }
                 Err(e) => eprintln!("{e:#}"),
             }
@@ -1305,6 +1379,7 @@ fn execute_builtin(
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::{BuiltinCommand, builtin_help_text, parse_builtin_command};
@@ -1316,8 +1391,14 @@ mod tests {
         assert_eq!(parse_builtin_command(":q"), Some(BuiltinCommand::Exit));
         assert_eq!(parse_builtin_command(":quit"), Some(BuiltinCommand::Exit));
         assert_eq!(parse_builtin_command(":r"), Some(BuiltinCommand::Reload));
-        assert_eq!(parse_builtin_command(":s"), Some(BuiltinCommand::ShortcutsList));
-        assert_eq!(parse_builtin_command(":h"), Some(BuiltinCommand::HistoryList));
+        assert_eq!(
+            parse_builtin_command(":s"),
+            Some(BuiltinCommand::ShortcutsList)
+        );
+        assert_eq!(
+            parse_builtin_command(":h"),
+            Some(BuiltinCommand::HistoryList)
+        );
     }
 
     #[test]
@@ -1343,7 +1424,10 @@ mod tests {
     #[test]
     fn parser_handles_non_builtin_and_unknown() {
         assert_eq!(parse_builtin_command("kubectl get pods"), None);
-        assert_eq!(parse_builtin_command(":something-else"), Some(BuiltinCommand::Unknown));
+        assert_eq!(
+            parse_builtin_command(":something-else"),
+            Some(BuiltinCommand::Unknown)
+        );
     }
 
     #[test]
@@ -1358,7 +1442,6 @@ mod tests {
 }
 
 fn main() -> anyhow::Result<()> {
-
     let mut config = load_config(CONFIG_FILE)?;
     let mut history_limit = config.history_limit();
     let mut shortcuts_file = shortcuts_file_for_profile(&config.active_profile);

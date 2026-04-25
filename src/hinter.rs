@@ -1,4 +1,4 @@
-﻿use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock};
 
 use nu_ansi_term::Style;
 use reedline::{Highlighter, Hinter, History, StyledText};
@@ -23,7 +23,8 @@ fn matching_suffix(shortcuts: &[String], line: &str, pos: usize) -> Option<Strin
 fn common_prefix_len(left: &str, right: &str) -> usize {
     let mut matched = 0;
 
-    for ((left_index, left_char), (_, right_char)) in left.char_indices().zip(right.char_indices()) {
+    for ((left_index, left_char), (_, right_char)) in left.char_indices().zip(right.char_indices())
+    {
         if left_char != right_char {
             break;
         }
@@ -171,10 +172,10 @@ impl Highlighter for HintHighlighter {
             styled_text.push((self.partial_match_style, matched.to_owned()));
         }
 
-        if let Some(unmatched) = line.get(match_len..) {
-            if !unmatched.is_empty() {
-                styled_text.push((self.unmatched_style, unmatched.to_owned()));
-            }
+        if let Some(unmatched) = line.get(match_len..)
+            && !unmatched.is_empty()
+        {
+            styled_text.push((self.unmatched_style, unmatched.to_owned()));
         }
 
         styled_text

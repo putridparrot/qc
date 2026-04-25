@@ -145,7 +145,10 @@ pub fn load_shortcuts(path: impl AsRef<Path>) -> Result<Vec<Shortcut>> {
 }
 
 pub fn shortcut_names(shortcuts: &[Shortcut]) -> Vec<String> {
-    shortcuts.iter().map(|shortcut| shortcut.name.clone()).collect()
+    shortcuts
+        .iter()
+        .map(|shortcut| shortcut.name.clone())
+        .collect()
 }
 
 fn write_shortcuts(path: impl AsRef<Path>, shortcuts: &[Shortcut]) -> Result<()> {
@@ -313,8 +316,12 @@ pub fn load_placeholder_values(path: impl AsRef<Path>) -> Result<HashMap<String,
         return Ok(HashMap::new());
     }
 
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read placeholder history file: {}", path.display()))?;
+    let content = fs::read_to_string(path).with_context(|| {
+        format!(
+            "Failed to read placeholder history file: {}",
+            path.display()
+        )
+    })?;
 
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for line in content.lines() {
@@ -333,7 +340,9 @@ pub fn load_placeholder_values(path: impl AsRef<Path>) -> Result<HashMap<String,
             continue;
         }
 
-        map.entry(key.to_owned()).or_default().push(value.to_owned());
+        map.entry(key.to_owned())
+            .or_default()
+            .push(value.to_owned());
     }
 
     Ok(map)
@@ -362,8 +371,12 @@ pub fn save_placeholder_values(
         format!("{}\n", lines.join("\n"))
     };
 
-    fs::write(path, content)
-        .with_context(|| format!("Failed to write placeholder history file: {}", path.display()))
+    fs::write(path, content).with_context(|| {
+        format!(
+            "Failed to write placeholder history file: {}",
+            path.display()
+        )
+    })
 }
 
 fn remember_placeholder_value(
@@ -401,8 +414,7 @@ pub fn prompt_for_args(command: &str, placeholder_file: impl AsRef<Path>) -> Res
 
         loop {
             let remembered_default = remembered.get(remembered_index).cloned();
-            let default = remembered_default
-                .or_else(|| placeholder.default_value.clone());
+            let default = remembered_default.or_else(|| placeholder.default_value.clone());
 
             if placeholder.sensitive {
                 print!("  {} [hidden]: ", placeholder.name);
@@ -513,7 +525,8 @@ mod tests {
 
     #[test]
     fn extract_template_fields_parses_defaults() {
-        let fields = extract_template_fields("kubectl logs {app} -n {namespace?default} --tail={lines?200}");
+        let fields =
+            extract_template_fields("kubectl logs {app} -n {namespace?default} --tail={lines?200}");
         assert_eq!(fields.len(), 3);
         assert_eq!(fields[0].name, "app");
         assert_eq!(fields[0].default_value, None);
@@ -528,7 +541,9 @@ mod tests {
 
     #[test]
     fn extract_template_fields_parses_sensitive() {
-        let fields = extract_template_fields("curl -H 'Authorization: Bearer {token!}' -H 'x={ns?default!}'");
+        let fields = extract_template_fields(
+            "curl -H 'Authorization: Bearer {token!}' -H 'x={ns?default!}'",
+        );
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "token");
         assert!(fields[0].sensitive);

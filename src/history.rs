@@ -45,11 +45,11 @@ pub fn append_history(
 
     entries.push(command.to_owned());
 
-    if let HistoryLimit::Limited(max_items) = history_limit {
-        if entries.len() > max_items {
-            let start = entries.len() - max_items;
-            entries = entries.split_off(start);
-        }
+    if let HistoryLimit::Limited(max_items) = history_limit
+        && entries.len() > max_items
+    {
+        let start = entries.len() - max_items;
+        entries = entries.split_off(start);
     }
 
     write_history(path, &entries)?;
@@ -68,12 +68,12 @@ pub fn prune_history(path: impl AsRef<Path>, history_limit: HistoryLimit) -> Res
 
     let mut entries = load_history(path)?;
 
-    if let HistoryLimit::Limited(max_items) = history_limit {
-        if entries.len() > max_items {
-            let start = entries.len() - max_items;
-            entries = entries.split_off(start);
-            write_history(path, &entries)?;
-        }
+    if let HistoryLimit::Limited(max_items) = history_limit
+        && entries.len() > max_items
+    {
+        let start = entries.len() - max_items;
+        entries = entries.split_off(start);
+        write_history(path, &entries)?;
     }
 
     Ok(entries)

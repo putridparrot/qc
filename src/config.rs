@@ -152,10 +152,7 @@ pub fn save_config(path: impl AsRef<Path>, config: &AppConfig) -> Result<()> {
 safety_policy={}\n\
 dry_run={}\n\
 active_profile={}\n",
-        config.max_history_items,
-        safety_policy,
-        config.dry_run,
-        config.active_profile
+        config.max_history_items, safety_policy, config.dry_run, config.active_profile
     );
 
     fs::write(path, content)
