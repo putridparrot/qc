@@ -1,2 +1,3 @@
+dir=1
 kubectl config use-context dev-cluster=3
 kubectl rollout restart deployment/test=1

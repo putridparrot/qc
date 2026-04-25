@@ -4,11 +4,11 @@
 
 It lets you:
 
-- define named shortcuts in `shortcuts.txt`
+- define named shortcuts in user-profile `shortcuts.txt`
 - execute raw shell commands directly
 - get inline autosuggestions while typing
 - highlight exact, prefix, and fuzzy matches differently
-- persist non-shortcut commands in `history.txt`
+- persist non-shortcut commands in user-profile `history.txt`
 - use templated shortcuts with runtime prompts such as `{app}` or `{pod}`
 - reload config and shortcuts without restarting
 - require confirmation for obviously dangerous commands
@@ -21,15 +21,16 @@ It lets you:
   - exact match: highlighted in light green italics
   - prefix match: matched portion italic, unmatched portion dimmed
   - fuzzy subsequence match: highlighted in yellow italics
-- Shortcut definitions loaded from `shortcuts.txt`
+- Shortcut definitions loaded from user-profile `shortcuts.txt`
 - Template placeholders in shortcut commands using `{name}` syntax
-- Persistent history for raw commands in `history.txt`
+- Persistent history for raw commands in user-profile `history.txt`
 - Deduplicated history entries
 - Configurable history retention in `config.txt`
 - Built-in commands:
   - `:help` / `:?`
   - `:doctor`
   - `:policy show`
+  - `:paths`
   - `:set dry-run on|off`
   - `:profile list`
   - `:profile use <name>`
@@ -113,7 +114,12 @@ What this does:
 
 ## How It Works
 
-When `qc` starts, it loads:
+When `qc` starts, it loads data from your OS user profile directory:
+
+- Windows: `%APPDATA%\\qc`
+- Linux/macOS: `$XDG_CONFIG_HOME/qc` or `~/.config/qc`
+
+From there it loads:
 
 - `config.txt` for application settings
 - `shortcuts.txt` for named shortcuts
@@ -128,13 +134,14 @@ At the prompt:
 - raw commands are appended to `history.txt` if history is enabled
 - shortcuts are not written to `history.txt`
 - shell-style navigation is supported with `cd`, `cd -`, `cd ~`, `pushd`, `popd`, `dirs`, `clear dirs`, and `pwd`
-- prompt includes the active profile and current folder, for example `QC [default] d:\\Development\\putridparrot\\qc>`
+- prompt includes current folder and, for non-default profiles, the active profile
+- for default profile, the prompt omits `[default]` unless `show_default_profile_in_prompt=true`
 
 ## Usage
 
 ### Run A Shortcut
 
-If `shortcuts.txt` contains:
+If user-profile `shortcuts.txt` contains:
 
 ```text
 kube-dev=kubectl config use-context dev-cluster
@@ -234,6 +241,16 @@ Example:
 
 ```text
 :policy show
+```
+
+### `:path` / `:paths`
+
+Prints the resolved user-profile data paths currently used by `qc`.
+
+Example:
+
+```text
+:path
 ```
 
 ### `:history` / `:h`
@@ -429,7 +446,7 @@ Example fuzzy match:
 
 ## Configuration
 
-Configuration lives in `config.txt` using a simple `key=value` format.
+Configuration lives in the user-profile `config.txt` using a simple `key=value` format.
 
 Current supported keys:
 
@@ -438,6 +455,7 @@ max_history_items=100
 safety_policy=confirm
 dry_run=false
 active_profile=default
+show_default_profile_in_prompt=false
 ```
 
 ### `max_history_items`
@@ -462,11 +480,16 @@ active_profile=default
 - `default`: uses `shortcuts.txt`
 - any other value (for example `prod`): uses `shortcuts.prod.txt`
 
+### `show_default_profile_in_prompt`
+
+- `false` (default): hide `[default]` in the prompt
+- `true`: show `[default]` in the prompt
+
 If history is disabled, `history.txt` is cleared on startup and no raw commands are stored.
 
 ## Shortcut File Format
 
-Shortcuts are defined in `shortcuts.txt`.
+Shortcuts are defined in user-profile `shortcuts.txt`.
 
 Rules:
 
@@ -489,7 +512,7 @@ kube-exec=kubectl exec -it {pod} -- /bin/bash
 
 ## History Behavior
 
-History is stored in `history.txt`.
+History is stored in user-profile `history.txt`.
 
 Important details:
 
@@ -544,7 +567,7 @@ Any answer other than `y` or `yes` aborts the command.
 
 ## Files
 
-The application currently uses these project-root files:
+The application currently uses these user-profile files (under `%APPDATA%\\qc` on Windows or `~/.config/qc` on Linux/macOS):
 
 - `config.txt`: configuration
 - `shortcuts.txt` and optional `shortcuts.<profile>.txt`: shortcut definitions

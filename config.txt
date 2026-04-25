@@ -20,6 +20,11 @@ dry_run=false
 # other values use shortcuts.<profile>.txt
 active_profile=default
 
+# Prompt display for default profile:
+# false = show "QC <cwd>" when profile is default
+# true  = show "QC [default] <cwd>"
+show_default_profile_in_prompt=false
+
 # Optional per-profile execution policy patterns:
 # policy.<profile>.allow=comma,separated,substrings
 # policy.<profile>.deny=comma,separated,substrings
