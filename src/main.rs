@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{AppConfig, SafetyPolicy, load_config, save_config};
@@ -27,29 +27,159 @@ use anyhow::{Context, bail};
 use nu_ansi_term::{Color, Style};
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
-const CONFIG_FILE: &str = "config.txt";
-const SHORTCUTS_FILE: &str = "shortcuts.txt";
-const HISTORY_FILE: &str = "history.txt";
-const HISTORY_PINS_FILE: &str = "history_pins.txt";
-const HISTORY_USAGE_FILE: &str = "history_usage.txt";
-const PLACEHOLDER_VALUES_FILE: &str = "placeholder_values.txt";
-const AUDIT_LOG_FILE: &str = "audit.log";
+const LEGACY_CONFIG_FILE: &str = "config.txt";
+const LEGACY_SHORTCUTS_FILE: &str = "shortcuts.txt";
+const LEGACY_HISTORY_FILE: &str = "history.txt";
+const LEGACY_HISTORY_PINS_FILE: &str = "history_pins.txt";
+const LEGACY_HISTORY_USAGE_FILE: &str = "history_usage.txt";
+const LEGACY_PLACEHOLDER_VALUES_FILE: &str = "placeholder_values.txt";
+const LEGACY_AUDIT_LOG_FILE: &str = "audit.log";
 const EXPORT_HEADER: &str = "# qc-export:v1";
-const BACKUP_DIR: &str = "backups";
-const LAST_BACKUP_FILE: &str = ".qc_last_backup";
+const LEGACY_BACKUP_DIR: &str = "backups";
+const LEGACY_LAST_BACKUP_FILE: &str = ".qc_last_backup";
 const EXIT_CODE_SUCCESS: i32 = 0;
 const EXIT_CODE_BLOCKED: i32 = 20;
 const EXIT_CODE_FAILED: i32 = 30;
 
+#[derive(Clone, Debug)]
+struct AppPaths {
+    data_dir: PathBuf,
+    config_file: String,
+    shortcuts_file: String,
+    history_file: String,
+    history_pins_file: String,
+    history_usage_file: String,
+    placeholder_values_file: String,
+    audit_log_file: String,
+    backup_dir: String,
+    last_backup_file: String,
+}
+
+static APP_PATHS: OnceLock<AppPaths> = OnceLock::new();
+
+fn app_paths() -> &'static AppPaths {
+    APP_PATHS
+        .get()
+        .expect("application paths have not been initialized")
+}
+
+fn os_user_data_dir() -> PathBuf {
+    if let Some(app_data) = env::var_os("APPDATA") {
+        return PathBuf::from(app_data).join("qc");
+    }
+    if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg_config_home).join("qc");
+    }
+    if let Some(home) = home_dir() {
+        return home.join(".config").join("qc");
+    }
+    PathBuf::from(".").join(".qc")
+}
+
+fn initialize_app_paths() -> anyhow::Result<AppPaths> {
+    let data_dir = os_user_data_dir();
+    fs::create_dir_all(&data_dir)
+        .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
+
+    let backup_dir = data_dir.join("backups");
+    fs::create_dir_all(&backup_dir).with_context(|| {
+        format!(
+            "Failed to create backup directory: {}",
+            backup_dir.display()
+        )
+    })?;
+
+    Ok(AppPaths {
+        data_dir: data_dir.clone(),
+        config_file: data_dir.join("config.txt").display().to_string(),
+        shortcuts_file: data_dir.join("shortcuts.txt").display().to_string(),
+        history_file: data_dir.join("history.txt").display().to_string(),
+        history_pins_file: data_dir.join("history_pins.txt").display().to_string(),
+        history_usage_file: data_dir.join("history_usage.txt").display().to_string(),
+        placeholder_values_file: data_dir
+            .join("placeholder_values.txt")
+            .display()
+            .to_string(),
+        audit_log_file: data_dir.join("audit.log").display().to_string(),
+        backup_dir: backup_dir.display().to_string(),
+        last_backup_file: data_dir.join(".qc_last_backup").display().to_string(),
+    })
+}
+
+fn maybe_migrate_legacy_file(legacy: &str, target: &str) -> anyhow::Result<()> {
+    let legacy_path = Path::new(legacy);
+    let target_path = Path::new(target);
+    if target_path.exists() || !legacy_path.exists() {
+        return Ok(());
+    }
+
+    fs::copy(legacy_path, target_path).with_context(|| {
+        format!(
+            "Failed to migrate {} to {}",
+            legacy_path.display(),
+            target_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_legacy_data_files(paths: &AppPaths) -> anyhow::Result<()> {
+    for (legacy, target) in [
+        (LEGACY_CONFIG_FILE, paths.config_file.as_str()),
+        (LEGACY_SHORTCUTS_FILE, paths.shortcuts_file.as_str()),
+        (LEGACY_HISTORY_FILE, paths.history_file.as_str()),
+        (LEGACY_HISTORY_PINS_FILE, paths.history_pins_file.as_str()),
+        (LEGACY_HISTORY_USAGE_FILE, paths.history_usage_file.as_str()),
+        (
+            LEGACY_PLACEHOLDER_VALUES_FILE,
+            paths.placeholder_values_file.as_str(),
+        ),
+        (LEGACY_AUDIT_LOG_FILE, paths.audit_log_file.as_str()),
+        (LEGACY_LAST_BACKUP_FILE, paths.last_backup_file.as_str()),
+    ] {
+        maybe_migrate_legacy_file(legacy, target)?;
+    }
+
+    let legacy_backup_dir = Path::new(LEGACY_BACKUP_DIR);
+    if legacy_backup_dir.exists() {
+        for entry in fs::read_dir(legacy_backup_dir)? {
+            let entry = entry?;
+            let source = entry.path();
+            if source.is_file() {
+                let target = Path::new(&paths.backup_dir).join(entry.file_name());
+                if !target.exists() {
+                    fs::copy(&source, &target).with_context(|| {
+                        format!(
+                            "Failed to migrate backup {} to {}",
+                            source.display(),
+                            target.display()
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 type SharedActiveProfile = Arc<RwLock<String>>;
+type SharedShowDefaultProfileInPrompt = Arc<RwLock<bool>>;
 
 struct CmdStylePrompt {
     active_profile: SharedActiveProfile,
+    show_default_profile_in_prompt: SharedShowDefaultProfileInPrompt,
 }
 
 impl CmdStylePrompt {
-    fn new(active_profile: SharedActiveProfile) -> Self {
-        Self { active_profile }
+    fn new(
+        active_profile: SharedActiveProfile,
+        show_default_profile_in_prompt: SharedShowDefaultProfileInPrompt,
+    ) -> Self {
+        Self {
+            active_profile,
+            show_default_profile_in_prompt,
+        }
     }
 
     fn current_dir_display() -> String {
@@ -64,6 +194,13 @@ impl CmdStylePrompt {
             .map(|profile| profile.clone())
             .unwrap_or_else(|_| "default".to_owned())
     }
+
+    fn show_default_profile_in_prompt(&self) -> bool {
+        self.show_default_profile_in_prompt
+            .read()
+            .map(|value| *value)
+            .unwrap_or(false)
+    }
 }
 
 impl Prompt for CmdStylePrompt {
@@ -76,11 +213,13 @@ impl Prompt for CmdStylePrompt {
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "QC [{}] {}>",
-            self.active_profile_display(),
-            Self::current_dir_display()
-        ))
+        let profile = self.active_profile_display();
+        let cwd = Self::current_dir_display();
+        if profile.eq_ignore_ascii_case("default") && !self.show_default_profile_in_prompt() {
+            Cow::Owned(format!("QC {}>", cwd))
+        } else {
+            Cow::Owned(format!("QC [{}] {}>", profile, cwd))
+        }
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
@@ -106,6 +245,7 @@ enum BuiltinCommand {
     Help,
     Doctor,
     PolicyShow,
+    Paths,
     SetDryRun(bool),
     ProfileList,
     ProfileUse(String),
@@ -152,6 +292,10 @@ fn parse_builtin_command(input: &str) -> Option<BuiltinCommand> {
 
     if input == ":policy show" {
         return Some(BuiltinCommand::PolicyShow);
+    }
+
+    if input == ":path" || input == ":paths" {
+        return Some(BuiltinCommand::Paths);
     }
 
     if input == ":set dry-run on" {
@@ -295,15 +439,19 @@ fn build_hint_names(sc_names: &[String], history_entries: &[String]) -> Vec<Stri
 
 fn shortcuts_file_for_profile(profile: &str) -> String {
     if profile.eq_ignore_ascii_case("default") {
-        SHORTCUTS_FILE.to_owned()
+        app_paths().shortcuts_file.clone()
     } else {
-        format!("shortcuts.{}.txt", profile)
+        app_paths()
+            .data_dir
+            .join(format!("shortcuts.{}.txt", profile))
+            .display()
+            .to_string()
     }
 }
 
 fn list_profiles() -> anyhow::Result<Vec<String>> {
     let mut profiles = vec!["default".to_owned()];
-    for entry in fs::read_dir(".")? {
+    for entry in fs::read_dir(&app_paths().data_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -332,10 +480,10 @@ fn append_audit_log(profile: &str, status: &str, command: &str) -> anyhow::Resul
         status,
         command.replace('\n', " ")
     );
-    let mut existing = fs::read_to_string(AUDIT_LOG_FILE).unwrap_or_default();
+    let mut existing = fs::read_to_string(&app_paths().audit_log_file).unwrap_or_default();
     existing.push_str(&line);
-    fs::write(AUDIT_LOG_FILE, existing)
-        .with_context(|| format!("Failed to write {}", AUDIT_LOG_FILE))
+    fs::write(&app_paths().audit_log_file, existing)
+        .with_context(|| format!("Failed to write {}", app_paths().audit_log_file))
 }
 
 fn generate_completion_script(shell: &str, shortcut_names: &[String]) -> anyhow::Result<String> {
@@ -387,7 +535,7 @@ fn run_doctor(config: &AppConfig, shortcuts_file: &str) -> anyhow::Result<()> {
     println!("  active_profile: {}", config.active_profile);
     println!("  shortcuts_file: {}", shortcuts_file);
 
-    match load_config(CONFIG_FILE) {
+    match load_config(&app_paths().config_file) {
         Ok(_) => println!("  config: ok"),
         Err(e) => println!("  config: error ({e:#})"),
     }
@@ -410,7 +558,7 @@ fn run_doctor(config: &AppConfig, shortcuts_file: &str) -> anyhow::Result<()> {
         }
         Err(e) => println!("  shortcuts: error ({e:#})"),
     }
-    match load_history(HISTORY_FILE) {
+    match load_history(&app_paths().history_file) {
         Ok(history) => println!("  history: ok ({} entries)", history.len()),
         Err(e) => println!("  history: error ({e:#})"),
     }
@@ -531,6 +679,7 @@ fn builtin_help_text() -> String {
         "Built-in commands (reserved ':' namespace):",
         "  :doctor                                       Validate config and data files",
         "  :policy show                                  Show execution policy for active profile",
+        "  :path | :paths                                Show resolved data file paths",
         "  :set dry-run on|off                           Toggle dry-run mode",
         "  :profile list                                 List available profiles",
         "  :profile use <name>                           Switch active profile",
@@ -672,12 +821,13 @@ fn format_shortcut(shortcut: &Shortcut) -> String {
 }
 
 fn create_backup(paths: &[&str]) -> anyhow::Result<PathBuf> {
-    fs::create_dir_all(BACKUP_DIR).with_context(|| format!("Failed to create {}", BACKUP_DIR))?;
+    fs::create_dir_all(&app_paths().backup_dir)
+        .with_context(|| format!("Failed to create {}", app_paths().backup_dir))?;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let backup_path = Path::new(BACKUP_DIR).join(format!("qc-backup-{ts}.txt"));
+    let backup_path = Path::new(&app_paths().backup_dir).join(format!("qc-backup-{ts}.txt"));
 
     let mut content = String::new();
     for path in paths {
@@ -692,8 +842,11 @@ fn create_backup(paths: &[&str]) -> anyhow::Result<PathBuf> {
 
     fs::write(&backup_path, content)
         .with_context(|| format!("Failed to write backup: {}", backup_path.display()))?;
-    fs::write(LAST_BACKUP_FILE, backup_path.to_string_lossy().as_ref())
-        .with_context(|| format!("Failed to write {}", LAST_BACKUP_FILE))?;
+    fs::write(
+        &app_paths().last_backup_file,
+        backup_path.to_string_lossy().as_ref(),
+    )
+    .with_context(|| format!("Failed to write {}", app_paths().last_backup_file))?;
     Ok(backup_path)
 }
 
@@ -734,8 +887,8 @@ fn restore_from_backup(backup_path: impl AsRef<Path>) -> anyhow::Result<()> {
 }
 
 fn restore_last_backup() -> anyhow::Result<()> {
-    let path = fs::read_to_string(LAST_BACKUP_FILE)
-        .with_context(|| format!("No backup available in {}", LAST_BACKUP_FILE))?;
+    let path = fs::read_to_string(&app_paths().last_backup_file)
+        .with_context(|| format!("No backup available in {}", app_paths().last_backup_file))?;
     restore_from_backup(path.trim())
 }
 
@@ -745,13 +898,16 @@ fn export_state(path: impl AsRef<Path>) -> anyhow::Result<()> {
     content.push_str(EXPORT_HEADER);
     content.push('\n');
     for (name, file) in [
-        ("config", CONFIG_FILE),
-        ("shortcuts", SHORTCUTS_FILE),
-        ("history", HISTORY_FILE),
-        ("pins", HISTORY_PINS_FILE),
-        ("usage", HISTORY_USAGE_FILE),
-        ("placeholder_values", PLACEHOLDER_VALUES_FILE),
-        ("audit", AUDIT_LOG_FILE),
+        ("config", app_paths().config_file.as_str()),
+        ("shortcuts", app_paths().shortcuts_file.as_str()),
+        ("history", app_paths().history_file.as_str()),
+        ("pins", app_paths().history_pins_file.as_str()),
+        ("usage", app_paths().history_usage_file.as_str()),
+        (
+            "placeholder_values",
+            app_paths().placeholder_values_file.as_str(),
+        ),
+        ("audit", app_paths().audit_log_file.as_str()),
     ] {
         content.push_str(&format!("[{name}]\n"));
         content.push_str(&fs::read_to_string(file).unwrap_or_default());
@@ -794,13 +950,16 @@ fn import_state(path: impl AsRef<Path>) -> anyhow::Result<()> {
     }
 
     for (section, file) in [
-        ("config", CONFIG_FILE),
-        ("shortcuts", SHORTCUTS_FILE),
-        ("history", HISTORY_FILE),
-        ("pins", HISTORY_PINS_FILE),
-        ("usage", HISTORY_USAGE_FILE),
-        ("placeholder_values", PLACEHOLDER_VALUES_FILE),
-        ("audit", AUDIT_LOG_FILE),
+        ("config", app_paths().config_file.as_str()),
+        ("shortcuts", app_paths().shortcuts_file.as_str()),
+        ("history", app_paths().history_file.as_str()),
+        ("pins", app_paths().history_pins_file.as_str()),
+        ("usage", app_paths().history_usage_file.as_str()),
+        (
+            "placeholder_values",
+            app_paths().placeholder_values_file.as_str(),
+        ),
+        ("audit", app_paths().audit_log_file.as_str()),
     ] {
         if let Some(lines) = sections.get(section) {
             let new_content = if lines.is_empty() {
@@ -909,7 +1068,7 @@ fn run_executable_command(
         append_audit_log(&config.active_profile, "ok", command)?;
     }
 
-    increment_usage(HISTORY_USAGE_FILE, command)?;
+    increment_usage(app_paths().history_usage_file.as_str(), command)?;
     Ok(CommandExecutionStatus::Executed)
 }
 
@@ -918,7 +1077,10 @@ fn execute_shortcut(
     config: &AppConfig,
     auto_yes: bool,
 ) -> anyhow::Result<CommandExecutionStatus> {
-    let command = match prompt_for_args(&shortcut.command, PLACEHOLDER_VALUES_FILE) {
+    let command = match prompt_for_args(
+        &shortcut.command,
+        app_paths().placeholder_values_file.as_str(),
+    ) {
         Ok(cmd) => cmd,
         Err(e) => {
             eprintln!("{e:#}");
@@ -992,7 +1154,7 @@ fn refresh_runtime_state(
     shared_hints: &SharedHints,
 ) -> anyhow::Result<Vec<String>> {
     let sc_names = shortcut_names(shortcuts);
-    let history_entries = load_history(HISTORY_FILE)?;
+    let history_entries = load_history(app_paths().history_file.as_str())?;
     refresh_hints(shared_hints, &sc_names, &history_entries);
     Ok(history_entries)
 }
@@ -1185,6 +1347,7 @@ fn execute_builtin(
     config: &mut AppConfig,
     history_limit: &mut crate::config::HistoryLimit,
     active_profile_for_prompt: &SharedActiveProfile,
+    show_default_profile_in_prompt: &SharedShowDefaultProfileInPrompt,
     shortcuts_file: &mut String,
     shortcuts: &mut Vec<Shortcut>,
     sc_names: &mut Vec<String>,
@@ -1215,9 +1378,27 @@ fn execute_builtin(
             }
             Ok(BuiltinOutcome::Continue)
         }
+        BuiltinCommand::Paths => {
+            println!("qc data paths:");
+            println!("  data_dir: {}", app_paths().data_dir.display());
+            println!("  config: {}", app_paths().config_file);
+            println!("  shortcuts(default): {}", app_paths().shortcuts_file);
+            println!("  shortcuts(active): {}", shortcuts_file);
+            println!("  history: {}", app_paths().history_file);
+            println!("  history_pins: {}", app_paths().history_pins_file);
+            println!("  history_usage: {}", app_paths().history_usage_file);
+            println!(
+                "  placeholder_values: {}",
+                app_paths().placeholder_values_file
+            );
+            println!("  audit_log: {}", app_paths().audit_log_file);
+            println!("  backups_dir: {}", app_paths().backup_dir);
+            println!("  last_backup_ref: {}", app_paths().last_backup_file);
+            Ok(BuiltinOutcome::Continue)
+        }
         BuiltinCommand::SetDryRun(enabled) => {
             config.dry_run = enabled;
-            save_config(CONFIG_FILE, config)?;
+            save_config(app_paths().config_file.as_str(), config)?;
             println!("dry_run set to {}", config.dry_run);
             Ok(BuiltinOutcome::Continue)
         }
@@ -1244,8 +1425,9 @@ fn execute_builtin(
             *shortcuts_file = shortcuts_file_for_profile(profile);
             *shortcuts = load_shortcuts(shortcuts_file.as_str()).unwrap_or_default();
             *sc_names = shortcut_names(shortcuts);
-            save_config(CONFIG_FILE, config)?;
-            let history_entries = load_history(HISTORY_FILE).unwrap_or_default();
+            save_config(app_paths().config_file.as_str(), config)?;
+            let history_entries =
+                load_history(app_paths().history_file.as_str()).unwrap_or_default();
             refresh_hints(shared_hints, sc_names, &history_entries);
             println!(
                 "Active profile set to '{}' using {}",
@@ -1269,7 +1451,7 @@ fn execute_builtin(
         }
         BuiltinCommand::Exit => Ok(BuiltinOutcome::Exit),
         BuiltinCommand::Reload => {
-            match load_config(CONFIG_FILE) {
+            match load_config(app_paths().config_file.as_str()) {
                 Ok(new_config) => {
                     *config = new_config;
                     *history_limit = config.history_limit();
@@ -1278,6 +1460,12 @@ fn execute_builtin(
                             .write()
                             .unwrap_or_else(|p| p.into_inner());
                         *active = config.active_profile.clone();
+                    }
+                    {
+                        let mut value = show_default_profile_in_prompt
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *value = config.show_default_profile_in_prompt;
                     }
                     *shortcuts_file = shortcuts_file_for_profile(&config.active_profile);
                 }
@@ -1290,7 +1478,8 @@ fn execute_builtin(
                 }
                 Err(e) => eprintln!("Failed to reload shortcuts: {e:#}"),
             }
-            let history_entries = load_history(HISTORY_FILE).unwrap_or_default();
+            let history_entries =
+                load_history(app_paths().history_file.as_str()).unwrap_or_default();
             refresh_hints(shared_hints, sc_names, &history_entries);
             println!("Configuration reloaded.");
             Ok(BuiltinOutcome::Continue)
@@ -1322,9 +1511,9 @@ fn execute_builtin(
                 scripted,
                 &[
                     shortcuts_file.as_str(),
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
@@ -1335,14 +1524,16 @@ fn execute_builtin(
                     println!("Shortcut added.");
                     *shortcuts = new_shortcuts;
                     *sc_names = shortcut_names(shortcuts);
-                    let history_entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let history_entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     refresh_hints(shared_hints, sc_names, &history_entries);
                 }
                 Ok((new_shortcuts, false)) => {
                     println!("Shortcut updated.");
                     *shortcuts = new_shortcuts;
                     *sc_names = shortcut_names(shortcuts);
-                    let history_entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let history_entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     refresh_hints(shared_hints, sc_names, &history_entries);
                 }
                 Err(e) => eprintln!("{e:#}"),
@@ -1355,9 +1546,9 @@ fn execute_builtin(
                 scripted,
                 &[
                     shortcuts_file.as_str(),
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
@@ -1372,7 +1563,8 @@ fn execute_builtin(
                     println!("Shortcut deleted.");
                     *shortcuts = new_shortcuts;
                     *sc_names = shortcut_names(shortcuts);
-                    let history_entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let history_entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     refresh_hints(shared_hints, sc_names, &history_entries);
                 }
                 Ok((_new_shortcuts, false)) => {
@@ -1384,23 +1576,25 @@ fn execute_builtin(
             Ok(BuiltinOutcome::Continue)
         }
         BuiltinCommand::HistoryList => {
-            let entries = load_history(HISTORY_FILE).unwrap_or_default();
-            let pins = load_string_set(HISTORY_PINS_FILE).unwrap_or_default();
-            let usage = load_usage(HISTORY_USAGE_FILE).unwrap_or_default();
+            let entries = load_history(app_paths().history_file.as_str()).unwrap_or_default();
+            let pins = load_string_set(app_paths().history_pins_file.as_str()).unwrap_or_default();
+            let usage = load_usage(app_paths().history_usage_file.as_str()).unwrap_or_default();
             print_history(&entries, &pins, &usage);
             Ok(BuiltinOutcome::Continue)
         }
         BuiltinCommand::HistoryRanked => {
-            let entries = load_history(HISTORY_FILE).unwrap_or_default();
-            let usage = load_usage(HISTORY_USAGE_FILE).unwrap_or_default();
+            let entries = load_history(app_paths().history_file.as_str()).unwrap_or_default();
+            let usage = load_usage(app_paths().history_usage_file.as_str()).unwrap_or_default();
             print_ranked_history(&entries, &usage);
             Ok(BuiltinOutcome::Continue)
         }
         BuiltinCommand::HistoryTop(count) => {
             match parse_optional_count(&count, 10) {
                 Ok(limit) => {
-                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
-                    let usage = load_usage(HISTORY_USAGE_FILE).unwrap_or_default();
+                    let entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
+                    let usage =
+                        load_usage(app_paths().history_usage_file.as_str()).unwrap_or_default();
                     let mut ranked = entries
                         .iter()
                         .map(|entry| (entry.clone(), usage.get(entry).copied().unwrap_or(0)))
@@ -1418,7 +1612,8 @@ fn execute_builtin(
         BuiltinCommand::HistoryRecent(count) => {
             match parse_optional_count(&count, 10) {
                 Ok(limit) => {
-                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     let start = entries.len().saturating_sub(limit);
                     for (offset, entry) in entries.iter().skip(start).enumerate() {
                         println!("  {:>3} {}", start + offset + 1, entry);
@@ -1432,10 +1627,10 @@ fn execute_builtin(
             maybe_backup(
                 scripted,
                 &[
-                    SHORTCUTS_FILE,
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().shortcuts_file.as_str(),
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
@@ -1445,7 +1640,7 @@ fn execute_builtin(
                 return Ok(BuiltinOutcome::Continue);
             }
 
-            match append_history(HISTORY_FILE, command, *history_limit) {
+            match append_history(app_paths().history_file.as_str(), command, *history_limit) {
                 Ok(history_entries) => {
                     println!("History entry added.");
                     refresh_hints(shared_hints, sc_names, &history_entries);
@@ -1463,7 +1658,7 @@ fn execute_builtin(
 
             let needle = query.to_ascii_lowercase();
             let mut found = false;
-            for (index, entry) in load_history(HISTORY_FILE)
+            for (index, entry) in load_history(app_paths().history_file.as_str())
                 .unwrap_or_default()
                 .iter()
                 .enumerate()
@@ -1483,7 +1678,8 @@ fn execute_builtin(
         BuiltinCommand::HistoryEdit(index) => {
             match index.trim().parse::<usize>() {
                 Ok(one_based_index) => {
-                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     if one_based_index == 0 || one_based_index > entries.len() {
                         eprintln!("History index out of range.");
                         return Ok(BuiltinOutcome::Continue);
@@ -1507,7 +1703,11 @@ fn execute_builtin(
                         *script_exit_code = status.exit_code();
                     }
                     if status.should_record_history() {
-                        let history_entries = append_history(HISTORY_FILE, edited, *history_limit)?;
+                        let history_entries = append_history(
+                            app_paths().history_file.as_str(),
+                            edited,
+                            *history_limit,
+                        )?;
                         refresh_hints(shared_hints, sc_names, &history_entries);
                     }
                 }
@@ -1518,7 +1718,8 @@ fn execute_builtin(
         BuiltinCommand::HistoryRun(index) => {
             match index.trim().parse::<usize>() {
                 Ok(one_based_index) => {
-                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     if one_based_index == 0 || one_based_index > entries.len() {
                         eprintln!("History index out of range.");
                         return Ok(BuiltinOutcome::Continue);
@@ -1530,8 +1731,11 @@ fn execute_builtin(
                         *script_exit_code = status.exit_code();
                     }
                     if status.should_record_history() {
-                        let history_entries =
-                            append_history(HISTORY_FILE, &command, *history_limit)?;
+                        let history_entries = append_history(
+                            app_paths().history_file.as_str(),
+                            &command,
+                            *history_limit,
+                        )?;
                         refresh_hints(shared_hints, sc_names, &history_entries);
                     }
                 }
@@ -1543,25 +1747,27 @@ fn execute_builtin(
             maybe_backup(
                 scripted,
                 &[
-                    SHORTCUTS_FILE,
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().shortcuts_file.as_str(),
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
             match index.trim().parse::<usize>() {
                 Ok(one_based_index) => {
-                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     if one_based_index == 0 || one_based_index > entries.len() {
                         eprintln!("History index out of range.");
                         return Ok(BuiltinOutcome::Continue);
                     }
                     let entry = entries[one_based_index - 1].clone();
-                    let mut pins = load_string_set(HISTORY_PINS_FILE).unwrap_or_default();
+                    let mut pins =
+                        load_string_set(app_paths().history_pins_file.as_str()).unwrap_or_default();
                     if !pins.contains(&entry) {
                         pins.push(entry);
-                        write_string_set(HISTORY_PINS_FILE, &pins)?;
+                        write_string_set(app_paths().history_pins_file.as_str(), &pins)?;
                     }
                     println!("History entry pinned.");
                 }
@@ -1573,26 +1779,28 @@ fn execute_builtin(
             maybe_backup(
                 scripted,
                 &[
-                    SHORTCUTS_FILE,
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().shortcuts_file.as_str(),
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
             match index.trim().parse::<usize>() {
                 Ok(one_based_index) => {
-                    let entries = load_history(HISTORY_FILE).unwrap_or_default();
+                    let entries =
+                        load_history(app_paths().history_file.as_str()).unwrap_or_default();
                     if one_based_index == 0 || one_based_index > entries.len() {
                         eprintln!("History index out of range.");
                         return Ok(BuiltinOutcome::Continue);
                     }
                     let entry = entries[one_based_index - 1].clone();
-                    let mut pins = load_string_set(HISTORY_PINS_FILE).unwrap_or_default();
+                    let mut pins =
+                        load_string_set(app_paths().history_pins_file.as_str()).unwrap_or_default();
                     let original_len = pins.len();
                     pins.retain(|pin| pin != &entry);
                     if pins.len() != original_len {
-                        write_string_set(HISTORY_PINS_FILE, &pins)?;
+                        write_string_set(app_paths().history_pins_file.as_str(), &pins)?;
                         println!("History entry unpinned.");
                     } else {
                         println!("History entry was not pinned.");
@@ -1606,16 +1814,16 @@ fn execute_builtin(
             maybe_backup(
                 scripted,
                 &[
-                    SHORTCUTS_FILE,
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().shortcuts_file.as_str(),
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
             let index = index.trim();
             if let Some((start, end)) = parse_history_range(index) {
-                match delete_history_range(HISTORY_FILE, start, end) {
+                match delete_history_range(app_paths().history_file.as_str(), start, end) {
                     Ok(history_entries) => {
                         println!("History range deleted.");
                         refresh_hints(shared_hints, sc_names, &history_entries);
@@ -1626,13 +1834,15 @@ fn execute_builtin(
             }
 
             match index.parse::<usize>() {
-                Ok(one_based_index) => match delete_history_entry(HISTORY_FILE, one_based_index) {
-                    Ok(history_entries) => {
-                        println!("History entry deleted.");
-                        refresh_hints(shared_hints, sc_names, &history_entries);
+                Ok(one_based_index) => {
+                    match delete_history_entry(app_paths().history_file.as_str(), one_based_index) {
+                        Ok(history_entries) => {
+                            println!("History entry deleted.");
+                            refresh_hints(shared_hints, sc_names, &history_entries);
+                        }
+                        Err(e) => eprintln!("{e:#}"),
                     }
-                    Err(e) => eprintln!("{e:#}"),
-                },
+                }
                 Err(_) => eprintln!("Expected ':history del <index>' with a numeric index."),
             }
             Ok(BuiltinOutcome::Continue)
@@ -1641,14 +1851,14 @@ fn execute_builtin(
             maybe_backup(
                 scripted,
                 &[
-                    SHORTCUTS_FILE,
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().shortcuts_file.as_str(),
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
-            match dedupe_history(HISTORY_FILE) {
+            match dedupe_history(app_paths().history_file.as_str()) {
                 Ok(history_entries) => {
                     println!("History deduped.");
                     refresh_hints(shared_hints, sc_names, &history_entries);
@@ -1661,18 +1871,18 @@ fn execute_builtin(
             maybe_backup(
                 scripted,
                 &[
-                    SHORTCUTS_FILE,
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
+                    app_paths().shortcuts_file.as_str(),
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
                 ],
             )?;
 
-            match clear_history(HISTORY_FILE) {
+            match clear_history(app_paths().history_file.as_str()) {
                 Ok(history_entries) => {
                     println!("History cleared.");
                     refresh_hints(shared_hints, sc_names, &history_entries);
-                    write_string_set(HISTORY_PINS_FILE, &[])?;
+                    write_string_set(app_paths().history_pins_file.as_str(), &[])?;
                 }
                 Err(e) => eprintln!("{e:#}"),
             }
@@ -1705,8 +1915,11 @@ fn execute_builtin(
                                     *script_exit_code = status.exit_code();
                                 }
                                 if status.should_record_history() {
-                                    let history_entries =
-                                        append_history(HISTORY_FILE, command, *history_limit)?;
+                                    let history_entries = append_history(
+                                        app_paths().history_file.as_str(),
+                                        command,
+                                        *history_limit,
+                                    )?;
                                     refresh_hints(shared_hints, sc_names, &history_entries);
                                 }
                             }
@@ -1739,7 +1952,7 @@ fn execute_builtin(
                 }
             }
 
-            for entry in load_history(HISTORY_FILE).unwrap_or_default() {
+            for entry in load_history(app_paths().history_file.as_str()).unwrap_or_default() {
                 if entry.to_ascii_lowercase().contains(&needle) {
                     last_find_results.push(FindResult::History(entry.clone()));
                     println!("  {:>3} [history] {}", last_find_results.len(), entry);
@@ -1775,7 +1988,7 @@ fn execute_builtin(
                     );
                 }
             }
-            for entry in load_history(HISTORY_FILE).unwrap_or_default() {
+            for entry in load_history(app_paths().history_file.as_str()).unwrap_or_default() {
                 if entry.to_ascii_lowercase().contains(&needle) {
                     choices.push(FindResult::History(entry.clone()));
                     println!("  {:>3} [history] {}", choices.len(), entry);
@@ -1812,8 +2025,11 @@ fn execute_builtin(
                             *script_exit_code = status.exit_code();
                         }
                         if status.should_record_history() {
-                            let history_entries =
-                                append_history(HISTORY_FILE, command, *history_limit)?;
+                            let history_entries = append_history(
+                                app_paths().history_file.as_str(),
+                                command,
+                                *history_limit,
+                            )?;
                             refresh_hints(shared_hints, sc_names, &history_entries);
                         }
                     }
@@ -1839,13 +2055,13 @@ fn execute_builtin(
             maybe_backup(
                 scripted,
                 &[
-                    CONFIG_FILE,
-                    SHORTCUTS_FILE,
+                    app_paths().config_file.as_str(),
+                    app_paths().shortcuts_file.as_str(),
                     shortcuts_file,
-                    HISTORY_FILE,
-                    HISTORY_PINS_FILE,
-                    HISTORY_USAGE_FILE,
-                    PLACEHOLDER_VALUES_FILE,
+                    app_paths().history_file.as_str(),
+                    app_paths().history_pins_file.as_str(),
+                    app_paths().history_usage_file.as_str(),
+                    app_paths().placeholder_values_file.as_str(),
                 ],
             )?;
 
@@ -1857,7 +2073,7 @@ fn execute_builtin(
 
             match import_state(path) {
                 Ok(()) => {
-                    *config = load_config(CONFIG_FILE)?;
+                    *config = load_config(app_paths().config_file.as_str())?;
                     *history_limit = config.history_limit();
                     {
                         let mut active = active_profile_for_prompt
@@ -1865,11 +2081,17 @@ fn execute_builtin(
                             .unwrap_or_else(|p| p.into_inner());
                         *active = config.active_profile.clone();
                     }
+                    {
+                        let mut value = show_default_profile_in_prompt
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *value = config.show_default_profile_in_prompt;
+                    }
                     *shortcuts_file = shortcuts_file_for_profile(&config.active_profile);
                     *shortcuts = load_shortcuts(shortcuts_file.as_str()).unwrap_or_default();
                     *sc_names = shortcut_names(shortcuts);
                     let history_entries = refresh_runtime_state(shortcuts, shared_hints)?;
-                    let _ = prune_history(HISTORY_FILE, *history_limit)?;
+                    let _ = prune_history(app_paths().history_file.as_str(), *history_limit)?;
                     println!(
                         "Imported state from {} ({} history entries).",
                         path,
@@ -1884,13 +2106,19 @@ fn execute_builtin(
         BuiltinCommand::Undo => {
             match restore_last_backup() {
                 Ok(()) => {
-                    *config = load_config(CONFIG_FILE)?;
+                    *config = load_config(app_paths().config_file.as_str())?;
                     *history_limit = config.history_limit();
                     {
                         let mut active = active_profile_for_prompt
                             .write()
                             .unwrap_or_else(|p| p.into_inner());
                         *active = config.active_profile.clone();
+                    }
+                    {
+                        let mut value = show_default_profile_in_prompt
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *value = config.show_default_profile_in_prompt;
                     }
                     *shortcuts_file = shortcuts_file_for_profile(&config.active_profile);
                     *shortcuts = load_shortcuts(shortcuts_file.as_str()).unwrap_or_default();
@@ -1933,6 +2161,8 @@ mod tests {
             parse_builtin_command(":policy show"),
             Some(BuiltinCommand::PolicyShow)
         );
+        assert_eq!(parse_builtin_command(":path"), Some(BuiltinCommand::Paths));
+        assert_eq!(parse_builtin_command(":paths"), Some(BuiltinCommand::Paths));
         assert_eq!(
             parse_builtin_command(":s"),
             Some(BuiltinCommand::ShortcutsList)
@@ -2008,14 +2238,19 @@ mod tests {
         assert!(snapshot.contains(":history top [count]"));
         assert!(snapshot.contains(":history recent [count]"));
         assert!(snapshot.contains(":policy show"));
+        assert!(snapshot.contains(":path | :paths"));
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    let paths = initialize_app_paths()?;
+    let _ = APP_PATHS.set(paths.clone());
+    migrate_legacy_data_files(&paths)?;
+
     let cli_args = env::args().skip(1).collect::<Vec<_>>();
     let cli = parse_cli_options(&cli_args)?;
 
-    let mut config = load_config(CONFIG_FILE)?;
+    let mut config = load_config(app_paths().config_file.as_str())?;
     if let Some(profile) = &cli.profile_override {
         config.active_profile = profile.clone();
     }
@@ -2030,7 +2265,7 @@ fn main() -> anyhow::Result<()> {
         vec![]
     });
     let mut sc_names = shortcut_names(&shortcuts);
-    let history_entries = prune_history(HISTORY_FILE, history_limit)?;
+    let history_entries = prune_history(app_paths().history_file.as_str(), history_limit)?;
     let hint_names = build_hint_names(&sc_names, &history_entries);
 
     let shared_hints: SharedHints = Arc::new(RwLock::new(hint_names));
@@ -2056,7 +2291,12 @@ fn main() -> anyhow::Result<()> {
 
     let active_profile_for_prompt: SharedActiveProfile =
         Arc::new(RwLock::new(config.active_profile.clone()));
-    let prompt = CmdStylePrompt::new(Arc::clone(&active_profile_for_prompt));
+    let show_default_profile_in_prompt: SharedShowDefaultProfileInPrompt =
+        Arc::new(RwLock::new(config.show_default_profile_in_prompt));
+    let prompt = CmdStylePrompt::new(
+        Arc::clone(&active_profile_for_prompt),
+        Arc::clone(&show_default_profile_in_prompt),
+    );
     let mut last_find_results: Vec<FindResult> = Vec::new();
     let mut previous_dir: Option<PathBuf> = None;
     let mut dir_stack: Vec<PathBuf> = Vec::new();
@@ -2075,7 +2315,8 @@ fn main() -> anyhow::Result<()> {
             }
             let status = run_executable_command(&scripted, &config, &[], cli.assume_yes)?;
             if status.should_record_history() {
-                let history_entries = append_history(HISTORY_FILE, &scripted, history_limit)?;
+                let history_entries =
+                    append_history(app_paths().history_file.as_str(), &scripted, history_limit)?;
                 refresh_hints(&shared_hints, &sc_names, &history_entries);
             }
             process::exit(status.exit_code());
@@ -2097,6 +2338,7 @@ fn main() -> anyhow::Result<()> {
             &mut config,
             &mut history_limit,
             &active_profile_for_prompt,
+            &show_default_profile_in_prompt,
             &mut shortcuts_file,
             &mut shortcuts,
             &mut sc_names,
@@ -2125,6 +2367,7 @@ fn main() -> anyhow::Result<()> {
                         &mut config,
                         &mut history_limit,
                         &active_profile_for_prompt,
+                        &show_default_profile_in_prompt,
                         &mut shortcuts_file,
                         &mut shortcuts,
                         &mut sc_names,
@@ -2151,7 +2394,11 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     match run_executable_command(input, &config, &[], false) {
                         Ok(status) if status.should_record_history() => {
-                            match append_history(HISTORY_FILE, input, history_limit) {
+                            match append_history(
+                                app_paths().history_file.as_str(),
+                                input,
+                                history_limit,
+                            ) {
                                 Ok(history_entries) => {
                                     refresh_hints(&shared_hints, &sc_names, &history_entries);
                                 }
