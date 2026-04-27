@@ -20,8 +20,9 @@ use crate::history::{
     load_history, prune_history,
 };
 use crate::shortcuts::{
-    Shortcut, add_shortcut_with_tags, delete_shortcut, filter_shortcuts_by_tag, find_shortcut,
-    is_dangerous, load_shortcuts, prompt_for_args, run_command, shortcut_names,
+    InlineArgs, Shortcut, add_shortcut_with_tags, delete_shortcut, filter_shortcuts_by_tag,
+    find_shortcut, is_dangerous, load_shortcuts, parse_inline_args, prompt_for_args, run_command,
+    shortcut_names,
 };
 use anyhow::{Context, bail};
 use nu_ansi_term::{Color, Style};
@@ -247,6 +248,7 @@ enum BuiltinCommand {
     PolicyShow,
     Paths,
     SetDryRun(bool),
+    SetShowRunning(bool),
     ProfileList,
     ProfileUse(String),
     Completion(String),
@@ -304,6 +306,14 @@ fn parse_builtin_command(input: &str) -> Option<BuiltinCommand> {
 
     if input == ":set dry-run off" {
         return Some(BuiltinCommand::SetDryRun(false));
+    }
+
+    if input == ":set show-running on" {
+        return Some(BuiltinCommand::SetShowRunning(true));
+    }
+
+    if input == ":set show-running off" {
+        return Some(BuiltinCommand::SetShowRunning(false));
     }
 
     if input == ":profile list" {
@@ -425,8 +435,66 @@ fn parse_builtin_command(input: &str) -> Option<BuiltinCommand> {
     Some(BuiltinCommand::Unknown)
 }
 
+fn builtin_command_hints() -> Vec<&'static str> {
+    vec![
+        ":help",
+        ":?",
+        ":doctor",
+        ":policy show",
+        ":path",
+        ":paths",
+        ":set dry-run on",
+        ":set dry-run off",
+        ":set show-running on",
+        ":set show-running off",
+        ":profile list",
+        ":profile use ",
+        ":completion ",
+        ":exit",
+        ":quit",
+        ":q",
+        ":reload",
+        ":r",
+        ":shortcuts",
+        ":s",
+        ":shortcuts tag ",
+        ":shortcuts add ",
+        ":shortcuts del ",
+        ":history",
+        ":h",
+        ":history ranked",
+        ":history top",
+        ":history top ",
+        ":history recent",
+        ":history recent ",
+        ":history add ",
+        ":history search ",
+        ":history edit ",
+        ":history run ",
+        ":history pin ",
+        ":history unpin ",
+        ":history del ",
+        ":history dedupe",
+        ":history clear",
+        ":find ",
+        ":find! ",
+        ":export ",
+        ":import ",
+        ":undo",
+    ]
+}
+
 fn build_hint_names(sc_names: &[String], history_entries: &[String]) -> Vec<String> {
-    let mut hint_names = sc_names.to_vec();
+    let mut hint_names: Vec<String> = builtin_command_hints()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+
+    for name in sc_names {
+        if !hint_names.contains(name) {
+            hint_names.push(name.clone());
+        }
+    }
 
     for entry in history_entries {
         if !hint_names.contains(entry) {
@@ -681,6 +749,7 @@ fn builtin_help_text() -> String {
         "  :policy show                                  Show execution policy for active profile",
         "  :path | :paths                                Show resolved data file paths",
         "  :set dry-run on|off                           Toggle dry-run mode",
+        "  :set show-running on|off                      Toggle shortcut execution echo",
         "  :profile list                                 List available profiles",
         "  :profile use <name>                           Switch active profile",
         "  :completion bash|powershell                   Generate shell completion file",
@@ -1076,10 +1145,12 @@ fn execute_shortcut(
     shortcut: &Shortcut,
     config: &AppConfig,
     auto_yes: bool,
+    inline: InlineArgs,
 ) -> anyhow::Result<CommandExecutionStatus> {
     let command = match prompt_for_args(
         &shortcut.command,
         app_paths().placeholder_values_file.as_str(),
+        &inline,
     ) {
         Ok(cmd) => cmd,
         Err(e) => {
@@ -1088,7 +1159,9 @@ fn execute_shortcut(
         }
     };
 
-    println!("Running {} -> {}", shortcut.name, command);
+    if config.show_running_command {
+        println!("Running {} -> {}", shortcut.name, command);
+    }
     run_executable_command(&command, config, &shortcut.tags, auto_yes)
 }
 
@@ -1400,6 +1473,15 @@ fn execute_builtin(
             config.dry_run = enabled;
             save_config(app_paths().config_file.as_str(), config)?;
             println!("dry_run set to {}", config.dry_run);
+            Ok(BuiltinOutcome::Continue)
+        }
+        BuiltinCommand::SetShowRunning(enabled) => {
+            config.show_running_command = enabled;
+            save_config(app_paths().config_file.as_str(), config)?;
+            println!(
+                "show_running_command set to {}",
+                config.show_running_command
+            );
             Ok(BuiltinOutcome::Continue)
         }
         BuiltinCommand::ProfileList => {
@@ -1900,7 +1982,12 @@ fn execute_builtin(
                         match &last_find_results[one_based_index - 1] {
                             FindResult::Shortcut(shortcut_name) => {
                                 if let Some(shortcut) = find_shortcut(shortcuts, shortcut_name) {
-                                    let status = execute_shortcut(shortcut, config, auto_yes)?;
+                                    let status = execute_shortcut(
+                                        shortcut,
+                                        config,
+                                        auto_yes,
+                                        InlineArgs::default(),
+                                    )?;
                                     if scripted {
                                         *script_exit_code = status.exit_code();
                                     }
@@ -2013,7 +2100,12 @@ fn execute_builtin(
                 Ok(index) if index > 0 && index <= choices.len() => match &choices[index - 1] {
                     FindResult::Shortcut(name) => {
                         if let Some(shortcut) = find_shortcut(shortcuts, name) {
-                            let status = execute_shortcut(shortcut, config, auto_yes)?;
+                            let status = execute_shortcut(
+                                shortcut,
+                                config,
+                                auto_yes,
+                                InlineArgs::default(),
+                            )?;
                             if scripted {
                                 *script_exit_code = status.exit_code();
                             }
@@ -2390,7 +2482,31 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if let Some(shortcut) = find_shortcut(&shortcuts, input) {
-                    let _ = execute_shortcut(shortcut, &config, false)?;
+                    // Exact match — no inline args supplied.
+                    let _ = execute_shortcut(shortcut, &config, false, InlineArgs::default())?;
+                } else if let Some((name, args_str)) = input.split_once(' ') {
+                    // Try matching just the first token as a shortcut name with trailing args.
+                    if let Some(shortcut) = find_shortcut(&shortcuts, name) {
+                        let inline = parse_inline_args(args_str);
+                        let _ = execute_shortcut(shortcut, &config, false, inline)?;
+                    } else {
+                        match run_executable_command(input, &config, &[], false) {
+                            Ok(status) if status.should_record_history() => {
+                                match append_history(
+                                    app_paths().history_file.as_str(),
+                                    input,
+                                    history_limit,
+                                ) {
+                                    Ok(history_entries) => {
+                                        refresh_hints(&shared_hints, &sc_names, &history_entries);
+                                    }
+                                    Err(error) => eprintln!("{error:#}"),
+                                }
+                            }
+                            Ok(_status) => {}
+                            Err(error) => eprintln!("{error:#}"),
+                        }
+                    }
                 } else {
                     match run_executable_command(input, &config, &[], false) {
                         Ok(status) if status.should_record_history() => {

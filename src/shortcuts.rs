@@ -264,6 +264,38 @@ pub fn run_command(command_line: &str) -> Result<()> {
     Ok(())
 }
 
+/// Arguments supplied inline when invoking a shortcut (e.g. `kube-pods mypods --name=val`).
+#[derive(Clone, Debug, Default)]
+pub struct InlineArgs {
+    /// Values mapped by position (index 0 = first placeholder).
+    pub positional: Vec<String>,
+    /// Values mapped by placeholder name via `--name=value` syntax.
+    pub named: HashMap<String, String>,
+}
+
+/// Parses the portion of user input that follows the shortcut name into
+/// positional and named inline arguments.
+///
+/// Tokens starting with `--` and containing `=` are treated as named args
+/// (`--name=value`). All other tokens are positional.
+pub fn parse_inline_args(args_str: &str) -> InlineArgs {
+    let mut positional = Vec::new();
+    let mut named = HashMap::new();
+
+    for token in args_str.split_whitespace() {
+        if let Some(stripped) = token.strip_prefix("--")
+            && let Some((key, value)) = stripped.split_once('=')
+            && !key.is_empty()
+        {
+            named.insert(key.to_owned(), value.to_owned());
+            continue;
+        }
+        positional.push(token.to_owned());
+    }
+
+    InlineArgs { positional, named }
+}
+
 /// Extracts `{placeholder}` names from a command template, in order, without duplicates.
 pub fn extract_template_fields(command: &str) -> Vec<TemplateField> {
     let mut placeholders = Vec::new();
@@ -395,7 +427,15 @@ fn remember_placeholder_value(
 
 /// Prompts the user for each `{placeholder}` found in `command` and returns
 /// the fully-expanded command string.
-pub fn prompt_for_args(command: &str, placeholder_file: impl AsRef<Path>) -> Result<String> {
+///
+/// Values already present in `inline` (by name or positional index) are used
+/// without prompting the user; remaining placeholders fall back to the
+/// interactive prompt.
+pub fn prompt_for_args(
+    command: &str,
+    placeholder_file: impl AsRef<Path>,
+    inline: &InlineArgs,
+) -> Result<String> {
     let placeholders = extract_template_fields(command);
     if placeholders.is_empty() {
         return Ok(command.to_owned());
@@ -405,7 +445,30 @@ pub fn prompt_for_args(command: &str, placeholder_file: impl AsRef<Path>) -> Res
     let mut remembered_values = load_placeholder_values(placeholder_file)?;
     let mut args = HashMap::new();
 
-    for placeholder in &placeholders {
+    for (pos_index, placeholder) in placeholders.iter().enumerate() {
+        // Check inline args: named takes precedence over positional.
+        if let Some(inline_value) = inline
+            .named
+            .get(&placeholder.name)
+            .or_else(|| inline.positional.get(pos_index))
+        {
+            let value = inline_value.clone();
+            println!(
+                "  {} = {}",
+                placeholder.name,
+                if placeholder.sensitive {
+                    "[hidden]"
+                } else {
+                    &value
+                }
+            );
+            if !placeholder.sensitive {
+                remember_placeholder_value(&mut remembered_values, &placeholder.name, &value, 10);
+            }
+            args.insert(placeholder.name.clone(), value);
+            continue;
+        }
+
         let remembered = remembered_values
             .get(&placeholder.name)
             .cloned()

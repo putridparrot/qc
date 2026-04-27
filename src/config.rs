@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub max_history_items: isize,
     pub safety_policy: SafetyPolicy,
     pub dry_run: bool,
+    pub show_running_command: bool,
     pub active_profile: String,
     pub show_default_profile_in_prompt: bool,
     pub profile_policies: HashMap<String, ExecutionPolicy>,
@@ -40,6 +41,7 @@ impl Default for AppConfig {
             max_history_items: 100,
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
+            show_running_command: true,
             active_profile: "default".to_owned(),
             show_default_profile_in_prompt: false,
             profile_policies: HashMap::new(),
@@ -140,6 +142,17 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
                     ),
                 }
             }
+            "show_running_command" => {
+                config.show_running_command = match value.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    _ => bail!(
+                        "Invalid show_running_command value at {}:{}; expected true or false",
+                        path.display(),
+                        index + 1
+                    ),
+                }
+            }
             "active_profile" => {
                 let profile = value.trim();
                 if profile.is_empty() {
@@ -227,11 +240,13 @@ pub fn save_config(path: impl AsRef<Path>, config: &AppConfig) -> Result<()> {
         "max_history_items={}\n\
 safety_policy={}\n\
 dry_run={}\n\
+show_running_command={}\n\
 active_profile={}\n\
 show_default_profile_in_prompt={}\n",
         config.max_history_items,
         safety_policy,
         config.dry_run,
+        config.show_running_command,
         config.active_profile,
         config.show_default_profile_in_prompt
     );
@@ -281,6 +296,7 @@ mod tests {
             max_history_items: 0,
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
+            show_running_command: true,
             active_profile: "default".to_owned(),
             show_default_profile_in_prompt: false,
             profile_policies: HashMap::new(),
@@ -289,6 +305,7 @@ mod tests {
             max_history_items: -1,
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
+            show_running_command: true,
             active_profile: "default".to_owned(),
             show_default_profile_in_prompt: false,
             profile_policies: HashMap::new(),
@@ -297,6 +314,7 @@ mod tests {
             max_history_items: 25,
             safety_policy: SafetyPolicy::Confirm,
             dry_run: false,
+            show_running_command: true,
             active_profile: "default".to_owned(),
             show_default_profile_in_prompt: false,
             profile_policies: HashMap::new(),
@@ -312,7 +330,7 @@ mod tests {
         let path = temp_file("config-valid");
         fs::write(
             &path,
-            "max_history_items=10\nsafety_policy=block\ndry_run=true\nactive_profile=prod\nshow_default_profile_in_prompt=true\npolicy.prod.allow=kubectl,get\npolicy.prod.deny=rm -rf,drop table\n",
+            "max_history_items=10\nsafety_policy=block\ndry_run=true\nshow_running_command=false\nactive_profile=prod\nshow_default_profile_in_prompt=true\npolicy.prod.allow=kubectl,get\npolicy.prod.deny=rm -rf,drop table\n",
         )
         .expect("write config");
 
@@ -320,6 +338,7 @@ mod tests {
         assert_eq!(cfg.max_history_items, 10);
         assert_eq!(cfg.safety_policy, SafetyPolicy::Block);
         assert!(cfg.dry_run);
+        assert!(!cfg.show_running_command);
         assert_eq!(cfg.active_profile, "prod");
         assert!(cfg.show_default_profile_in_prompt);
         let prod = cfg.policy_for_profile("prod");
@@ -348,6 +367,7 @@ mod tests {
             max_history_items: 7,
             safety_policy: SafetyPolicy::Warn,
             dry_run: true,
+            show_running_command: false,
             active_profile: "dev".to_owned(),
             show_default_profile_in_prompt: false,
             profile_policies: HashMap::from([(
@@ -364,6 +384,7 @@ mod tests {
         assert_eq!(reloaded.max_history_items, 7);
         assert_eq!(reloaded.safety_policy, SafetyPolicy::Warn);
         assert!(reloaded.dry_run);
+        assert!(!reloaded.show_running_command);
         assert_eq!(reloaded.active_profile, "dev");
         assert!(!reloaded.show_default_profile_in_prompt);
         let dev = reloaded.policy_for_profile("dev");
