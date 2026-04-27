@@ -454,6 +454,7 @@ Current supported keys:
 max_history_items=100
 safety_policy=confirm
 dry_run=false
+show_running_command=true
 active_profile=default
 show_default_profile_in_prompt=false
 ```
@@ -474,6 +475,11 @@ show_default_profile_in_prompt=false
 
 - `true`: command execution is skipped after preview/safety checks
 - `false`: normal behavior
+
+### `show_running_command`
+
+- `true` (default): print `Running <shortcut> -> <expanded command>` before execution
+- `false`: suppress that execution echo line
 
 ### `active_profile`
 
